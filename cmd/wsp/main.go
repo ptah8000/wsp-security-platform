@@ -147,6 +147,14 @@ func run(ctx context.Context, cfg config.Config) error {
 
 	rbiOrch := initRBI(cfg)
 
+	// Hourly retention: drop request_logs / audit_logs older than settings, batches of 5000.
+	retention := logging.NewRetentionJob(st)
+	go retention.Start(ctx)
+	slog.Info("retention job started",
+		"interval", logging.DefaultRetentionInterval.String(),
+		"batch_size", logging.DefaultRetentionBatchSize,
+	)
+
 	errc := make(chan error, 2)
 	var proxySrv *proxy.Server
 

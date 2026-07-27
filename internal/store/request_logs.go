@@ -570,6 +570,35 @@ func scanRequestLog(row scannable) (RequestLog, error) {
 	return out, nil
 }
 
+// DeleteRequestLogsBefore deletes up to limit request_logs rows with ts < before.
+// Used by the hourly retention job (batches of 5000). Returns rows deleted.
+// Primary key is (id, ts) on the partitioned table.
+func (s *Store) DeleteRequestLogsBefore(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if s == nil || s.pool == nil {
+		return 0, fmt.Errorf("store is nil")
+	}
+	if before.IsZero() {
+		return 0, fmt.Errorf("before timestamp is required")
+	}
+	if limit <= 0 {
+		limit = 5000
+	}
+	const q = `
+DELETE FROM request_logs
+WHERE (id, ts) IN (
+    SELECT id, ts FROM request_logs
+    WHERE ts < $1
+    ORDER BY ts ASC
+    LIMIT $2
+)
+`
+	tag, err := s.pool.Exec(ctx, q, before.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete request logs before %s: %w", before.UTC().Format(time.RFC3339), err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func jsonOrEmptyObject(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return json.RawMessage(`{}`)

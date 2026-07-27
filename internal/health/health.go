@@ -3,7 +3,10 @@ package health
 
 import (
 	"context"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -134,22 +137,93 @@ func (c *Checker) Check(ctx context.Context) Report {
 				Name: "rbi_docker", Status: StatusHealthy, Message: "ok", Detail: detail,
 			})
 		}
+	} else if c.RBIActiveCount != nil {
+		// Still report active RBI count when docker probe is not wired.
+		rep.Components = append(rep.Components, Component{
+			Name:   "rbi",
+			Status: StatusHealthy,
+			Detail: map[string]any{"active_sessions": c.RBIActiveCount()},
+		})
 	}
 
-	// Best-effort process stats (always healthy).
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	rep.Components = append(rep.Components, Component{
-		Name:   "process",
-		Status: StatusHealthy,
-		Detail: map[string]any{
-			"alloc_bytes":   ms.Alloc,
-			"sys_bytes":     ms.Sys,
-			"num_gc":        ms.NumGC,
-			"num_cpu":       runtime.NumCPU(),
-			"num_goroutine": runtime.NumGoroutine(),
-		},
-	})
+	// Best-effort process + host stats (always healthy; metrics are informational).
+	rep.Components = append(rep.Components, processComponent())
 
 	return rep
+}
+
+func processComponent() Component {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	detail := map[string]any{
+		"alloc_bytes":       ms.Alloc,
+		"total_alloc_bytes": ms.TotalAlloc,
+		"sys_bytes":         ms.Sys,
+		"heap_inuse_bytes":  ms.HeapInuse,
+		"heap_sys_bytes":    ms.HeapSys,
+		"num_gc":            ms.NumGC,
+		"num_cpu":           runtime.NumCPU(),
+		"gomaxprocs":        runtime.GOMAXPROCS(0),
+		"num_goroutine":     runtime.NumGoroutine(),
+	}
+	if load, ok := readLoadAverage(); ok {
+		detail["load_avg_1"] = load[0]
+		detail["load_avg_5"] = load[1]
+		detail["load_avg_15"] = load[2]
+	}
+	if rss, ok := readRSSBytes(); ok {
+		detail["rss_bytes"] = rss
+	}
+
+	return Component{
+		Name:    "process",
+		Status:  StatusHealthy,
+		Message: "ok",
+		Detail:  detail,
+	}
+}
+
+// readLoadAverage is best-effort (Linux /proc/loadavg). Returns 1/5/15 min averages.
+func readLoadAverage() ([3]float64, bool) {
+	b, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return [3]float64{}, false
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) < 3 {
+		return [3]float64{}, false
+	}
+	var out [3]float64
+	for i := 0; i < 3; i++ {
+		v, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
+			return [3]float64{}, false
+		}
+		out[i] = v
+	}
+	return out, true
+}
+
+// readRSSBytes is best-effort RSS from Linux /proc/self/status (VmRSS, kB).
+func readRSSBytes() (uint64, bool) {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0, false
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return kb * 1024, true
+	}
+	return 0, false
 }

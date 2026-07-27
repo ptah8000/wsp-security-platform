@@ -93,6 +93,34 @@ RETURNING id, ts, actor_user_id, actor_username, action, target_type, target_id,
 	return out, nil
 }
 
+// DeleteAuditLogsBefore deletes up to limit audit_logs rows with ts < before.
+// Used by the hourly retention job. Returns rows deleted.
+func (s *Store) DeleteAuditLogsBefore(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if s == nil || s.pool == nil {
+		return 0, fmt.Errorf("store is nil")
+	}
+	if before.IsZero() {
+		return 0, fmt.Errorf("before timestamp is required")
+	}
+	if limit <= 0 {
+		limit = 5000
+	}
+	const q = `
+DELETE FROM audit_logs
+WHERE id IN (
+    SELECT id FROM audit_logs
+    WHERE ts < $1
+    ORDER BY ts ASC
+    LIMIT $2
+)
+`
+	tag, err := s.pool.Exec(ctx, q, before.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete audit logs before %s: %w", before.UTC().Format(time.RFC3339), err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // AuditListFilter constrains ListAuditLogs.
 type AuditListFilter struct {
 	Action string
