@@ -141,3 +141,42 @@ Partial unique index `certificates_one_active_ca_idx` remains the DB-level guara
 - Wiring `certs.Provider` into `cmd/wsp` or MITM proxy (Task 6+)
 - Policy engine (Task 5)
 - Customer-uploaded intermediate / subordinate CA
+
+---
+
+## Review fix: CA generation epoch and load races
+
+**Status:** DONE  
+**Git:** `fix: certs CA generation epoch and load races` — Author WSP Dev \<dev@wsp.local\>  
+**Date:** 2026-07-27
+
+### Findings addressed
+
+1. **CA generation epoch**
+   - `Provider.generation` increments on every successful CA install (`installCA` / `tryInstallCA`).
+   - `LeafCache` tracks `generation`; entries are stamped at `Put`.
+   - `Get` drops / misses mismatched-generation entries; `Put` is a no-op when `generation != cache.generation`.
+   - On rotate (`GenerateSelfSignedCA`): bump gen → `SetGeneration` → `Clear`, so concurrent `SignHost` cannot re-insert leaves signed under the old CA after Clear.
+
+2. **`loadActiveCA` vs `GenerateSelfSignedCA` race**
+   - Snapshot `expectedGen` before slow DB/decrypt work.
+   - `tryInstallCA` installs only when memory is still empty **and** `generation == expectedGen`.
+   - Never overwrites a newer in-memory CA with an older load result.
+
+3. **Host cache key / dead code**
+   - `normalizeHost` lowercases host (and port-stripped form) for stable cache keys.
+   - Removed unused `caCertPEM` / `_ = caCertPEM` in `SignHost` (chain already uses `caCert.Raw`).
+
+4. **Tests**
+   - `TestLeafCacheGenerationMismatch` — stale Put ignored after gen bump + Clear.
+   - `TestCAGenerationEpochBumpsOnInstall` / `TestStaleLeafPutIgnoredAfterRotation`.
+   - `TestTryInstallCADoesNotOverwriteNewer` — concurrent older load refused.
+   - `TestSealOpenInstallSignPath` — Seal → Open → install → `SignHost`, wipe memory, reload via decrypt path (nil store; no live Postgres).
+   - `TestSignHostLowercasesHostCacheKey` — `Example.COM` / `example.com` share cache entry.
+   - Existing nil-store path remains valid.
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `go test ./internal/certs/...` | PASS |

@@ -12,18 +12,22 @@ const DefaultLeafCacheSize = 1024
 
 // leafCacheEntry holds a cached leaf and when we consider it stale for MITM reuse.
 type leafCacheEntry struct {
-	host      string
-	cert      *tls.Certificate
-	notAfter  time.Time
-	expiresAt time.Time // when the cache entry should be treated as expired
+	host       string
+	cert       *tls.Certificate
+	notAfter   time.Time
+	expiresAt  time.Time // when the cache entry should be treated as expired
+	generation uint64    // CA generation that signed this leaf
 }
 
 // LeafCache is a thread-safe LRU cache of per-host leaf certificates.
+// Entries are stamped with a CA generation; Get/Put ignore mismatched generations
+// so concurrent SignHost cannot re-insert leaves after CA rotation.
 type LeafCache struct {
-	mu      sync.Mutex
-	max     int
-	ll      *list.List // front = most recently used
-	entries map[string]*list.Element
+	mu         sync.Mutex
+	max        int
+	ll         *list.List // front = most recently used
+	entries    map[string]*list.Element
+	generation uint64
 }
 
 // NewLeafCache returns an LRU leaf cache with the given max size.
@@ -39,8 +43,29 @@ func NewLeafCache(max int) *LeafCache {
 	}
 }
 
-// Get returns a cached certificate for host if present and not expired.
-// Expired entries are removed.
+// Generation returns the current CA generation associated with this cache.
+func (c *LeafCache) Generation() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
+}
+
+// SetGeneration updates the CA generation used for Get/Put matching.
+// Stale entries stamped with other generations are ignored (and dropped on Get).
+func (c *LeafCache) SetGeneration(gen uint64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.generation = gen
+}
+
+// Get returns a cached certificate for host if present, not expired, and stamped
+// with the current CA generation. Expired or mismatched entries are removed.
 func (c *LeafCache) Get(host string) (*tls.Certificate, bool) {
 	if c == nil || host == "" {
 		return nil, false
@@ -53,6 +78,10 @@ func (c *LeafCache) Get(host string) (*tls.Certificate, bool) {
 		return nil, false
 	}
 	ent := el.Value.(*leafCacheEntry)
+	if ent.generation != c.generation {
+		c.removeElement(el)
+		return nil, false
+	}
 	now := time.Now()
 	if !ent.expiresAt.IsZero() && !now.Before(ent.expiresAt) {
 		c.removeElement(el)
@@ -70,12 +99,18 @@ func (c *LeafCache) Get(host string) (*tls.Certificate, bool) {
 // Put stores cert for host, evicting the least-recently-used entry if at capacity.
 // notAfter is the leaf certificate's validity end; the entry is considered expired
 // a short safety margin before that (or immediately if already past).
-func (c *LeafCache) Put(host string, cert *tls.Certificate, notAfter time.Time) {
+// generation must match the cache's current CA generation; otherwise the put is ignored
+// (prevents concurrent SignHost from re-inserting leaves after CA rotation/Clear).
+func (c *LeafCache) Put(host string, cert *tls.Certificate, notAfter time.Time, generation uint64) {
 	if c == nil || host == "" || cert == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if generation != c.generation {
+		return
+	}
 
 	// Expire a few minutes early so we don't hand out nearly-dead certs.
 	expiresAt := notAfter
@@ -89,10 +124,11 @@ func (c *LeafCache) Put(host string, cert *tls.Certificate, notAfter time.Time) 
 	if el, ok := c.entries[host]; ok {
 		c.ll.MoveToFront(el)
 		el.Value = &leafCacheEntry{
-			host:      host,
-			cert:      cert,
-			notAfter:  notAfter,
-			expiresAt: expiresAt,
+			host:       host,
+			cert:       cert,
+			notAfter:   notAfter,
+			expiresAt:  expiresAt,
+			generation: generation,
 		}
 		return
 	}
@@ -101,10 +137,11 @@ func (c *LeafCache) Put(host string, cert *tls.Certificate, notAfter time.Time) 
 		c.evictOldest()
 	}
 	el := c.ll.PushFront(&leafCacheEntry{
-		host:      host,
-		cert:      cert,
-		notAfter:  notAfter,
-		expiresAt: expiresAt,
+		host:       host,
+		cert:       cert,
+		notAfter:   notAfter,
+		expiresAt:  expiresAt,
+		generation: generation,
 	})
 	c.entries[host] = el
 }
@@ -120,6 +157,8 @@ func (c *LeafCache) Len() int {
 }
 
 // Clear removes all entries (e.g. after CA rotation).
+// Callers should SetGeneration to the new CA generation before or after Clear so
+// concurrent Put with the old generation is ignored.
 func (c *LeafCache) Clear() {
 	if c == nil {
 		return

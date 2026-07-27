@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,15 +48,20 @@ type CertMeta struct {
 // Provider generates and stores a self-signed CA, and signs short-lived leaf
 // certificates for MITM. The active CA private key is held in memory after
 // generation or first load/decrypt from the store.
+//
+// generation is a monotonic epoch bumped on every successful CA install. Leaf
+// cache entries are stamped with it so concurrent SignHost cannot re-insert
+// leaves signed by a prior CA after rotation.
 type Provider struct {
 	store   *store.Store
 	dataKey []byte
 	cache   *LeafCache
 
-	mu        sync.RWMutex
-	caCert    *x509.Certificate
-	caKey     crypto.Signer
-	caCertPEM []byte
+	mu         sync.RWMutex
+	caCert     *x509.Certificate
+	caKey      crypto.Signer
+	caCertPEM  []byte
+	generation uint64
 }
 
 // NewProvider builds a certs.Provider. dataKey is the WSP_DATA_KEY string
@@ -165,12 +171,11 @@ func (p *Provider) GenerateSelfSignedCA(ctx context.Context, name string) (CertM
 		meta.IsActive = row.IsActive
 	}
 
-	// Install active CA in memory and drop leaves signed by any previous CA.
-	p.mu.Lock()
-	p.caCert = caCert
-	p.caKey = priv
-	p.caCertPEM = certPEM
-	p.mu.Unlock()
+	// Install active CA in memory (bumps generation) and drop leaves signed by any previous CA.
+	// SetGeneration before Clear so concurrent SignHost Put with the old generation is ignored
+	// even if it races after Clear.
+	gen := p.installCA(caCert, priv, certPEM)
+	p.cache.SetGeneration(gen)
 	p.cache.Clear()
 
 	return meta, nil
@@ -226,7 +231,7 @@ func (p *Provider) SignHost(host string) (*tls.Certificate, error) {
 	p.mu.RLock()
 	caCert := p.caCert
 	caKey := p.caKey
-	caCertPEM := p.caCertPEM
+	gen := p.generation
 	p.mu.RUnlock()
 	if caCert == nil || caKey == nil {
 		return nil, errors.New("no active CA")
@@ -243,10 +248,9 @@ func (p *Provider) SignHost(host string) (*tls.Certificate, error) {
 		PrivateKey:  leaf.PrivateKey,
 		Leaf:        leaf.Leaf,
 	}
-	// Keep caCertPEM referenced so callers who only have leaf still have chain DER.
-	_ = caCertPEM
 
-	p.cache.Put(host, tlsCert, notAfter)
+	// Put is a no-op if gen no longer matches (CA rotated while we signed).
+	p.cache.Put(host, tlsCert, notAfter, gen)
 	return tlsCert, nil
 }
 
@@ -262,10 +266,21 @@ func (p *Provider) ensureCALoaded(ctx context.Context) error {
 }
 
 // loadActiveCA fetches the active CA from the store, decrypts the key, and installs it.
+// Race-safe vs GenerateSelfSignedCA: only installs if memory is still empty and the
+// generation epoch still matches the value observed before the slow DB/decrypt path,
+// so a concurrent Generate cannot be overwritten by an older load.
 func (p *Provider) loadActiveCA(ctx context.Context) error {
 	if p.store == nil {
 		return nil // in-memory-only mode; GenerateSelfSignedCA must have been called
 	}
+
+	p.mu.RLock()
+	if p.caCert != nil && p.caKey != nil {
+		p.mu.RUnlock()
+		return nil
+	}
+	expectedGen := p.generation
+	p.mu.RUnlock()
 
 	row, ok, err := p.store.GetActiveCertificate(ctx, store.CertKindSelfSignedCA)
 	if err != nil {
@@ -285,12 +300,89 @@ func (p *Provider) loadActiveCA(ctx context.Context) error {
 		return err
 	}
 
+	// Install only if still empty and generation matches expected; never overwrite a
+	// newer in-memory CA (e.g. concurrent GenerateSelfSignedCA) with this load.
+	if gen, installed := p.tryInstallCA(caCert, caKey, []byte(row.CertPEM), expectedGen); installed {
+		p.cache.SetGeneration(gen)
+	}
+	return nil
+}
+
+// installCA installs the CA unconditionally (used by GenerateSelfSignedCA) and
+// returns the new generation epoch.
+func (p *Provider) installCA(caCert *x509.Certificate, caKey crypto.Signer, certPEM []byte) uint64 {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.caCert = caCert
 	p.caKey = caKey
-	p.caCertPEM = []byte(row.CertPEM)
-	p.mu.Unlock()
-	return nil
+	p.caCertPEM = append([]byte(nil), certPEM...)
+	p.generation++
+	return p.generation
+}
+
+// tryInstallCA installs the CA only when memory is still empty and generation still
+// equals expectedGen. Returns the new generation and whether install happened.
+// This prevents loadActiveCA from overwriting a newer CA installed by GenerateSelfSignedCA.
+func (p *Provider) tryInstallCA(caCert *x509.Certificate, caKey crypto.Signer, certPEM []byte, expectedGen uint64) (gen uint64, installed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Don't overwrite a newer (or any) in-memory CA with an older load result.
+	if p.caCert != nil && p.caKey != nil {
+		return p.generation, false
+	}
+	// Generation advanced (e.g. concurrent install that later cleared) — skip.
+	if p.generation != expectedGen {
+		return p.generation, false
+	}
+
+	p.caCert = caCert
+	p.caKey = caKey
+	p.caCertPEM = append([]byte(nil), certPEM...)
+	p.generation++
+	return p.generation, true
+}
+
+// wipeCAForTest clears in-memory CA state (tests only). Does not touch the store.
+func (p *Provider) wipeCAForTest() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.caCert = nil
+	p.caKey = nil
+	p.caCertPEM = nil
+	// generation intentionally left as-is so reload still bumps
+}
+
+// installFromEncryptedForTest decrypts keyPEMEncrypted, parses certPEM, and installs
+// the CA using the same race-safe path as loadActiveCA (tests only; nil-store ok).
+func (p *Provider) installFromEncryptedForTest(certPEM, keyPEMEncrypted []byte) error {
+	p.mu.RLock()
+	ready := p.caCert != nil && p.caKey != nil
+	expectedGen := p.generation
+	p.mu.RUnlock()
+	if ready {
+		return nil
+	}
+
+	keyPEM, err := Open(p.dataKey, keyPEMEncrypted)
+	if err != nil {
+		return fmt.Errorf("decrypt CA key: %w", err)
+	}
+	caCert, caKey, err := parseCAMaterial(certPEM, keyPEM)
+	if err != nil {
+		return err
+	}
+	if gen, installed := p.tryInstallCA(caCert, caKey, certPEM, expectedGen); installed {
+		p.cache.SetGeneration(gen)
+		return nil
+	}
+	// Concurrent install may have won; otherwise refuse empty+mismatch.
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.caCert != nil && p.caKey != nil {
+		return nil
+	}
+	return errors.New("install refused: CA empty but generation mismatch")
 }
 
 func parseCAMaterial(certPEM, keyPEM []byte) (*x509.Certificate, crypto.Signer, error) {
@@ -403,16 +495,16 @@ func randomSerial() (*big.Int, error) {
 	return n, nil
 }
 
-// normalizeHost strips a trailing port if present (host:port → host).
-// IPv6 bracket form [addr]:port is supported.
+// normalizeHost strips a trailing port if present (host:port → host) and lowercases
+// the host for cache-key stability. IPv6 bracket form [addr]:port is supported.
 func normalizeHost(host string) string {
 	if host == "" {
 		return ""
 	}
 	// host:port or [ipv6]:port
 	if h, _, err := net.SplitHostPort(host); err == nil {
-		return h
+		return strings.ToLower(h)
 	}
-	// Bare IPv6 without brackets — leave as-is for ParseIP in signLeaf.
-	return host
+	// Bare IPv6 without brackets — leave structure as-is; ToLower is fine for hex.
+	return strings.ToLower(host)
 }
