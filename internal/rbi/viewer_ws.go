@@ -206,38 +206,101 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
 	if flags.BlockCopyTo {
 		blockPaste = "true"
 	}
-	// Seamless: no “RBI” branding, full-viewport canvas, subtle loading status only.
+	// Seamless full-window canvas; remote viewport tracks browser size.
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
 <title>%s</title>
 <style>
-  html,body{margin:0;height:100%%;background:#111;overflow:hidden;font-family:system-ui,sans-serif}
-  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#111}
-  canvas{max-width:100%%;max-height:100%%;background:#111;cursor:default;outline:none}
-  #status{position:fixed;left:12px;bottom:10px;color:rgba(255,255,255,.45);font-size:12px;pointer-events:none;z-index:2}
-  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#ff8a80;background:#111;padding:24px;text-align:center;z-index:3}
+  html,body{margin:0;width:100%%;height:100%%;background:#0a0a0a;overflow:hidden;touch-action:none}
+  #c{display:block;width:100vw;height:100vh;background:#0a0a0a;cursor:default;outline:none}
+  #status{position:fixed;left:12px;bottom:10px;color:rgba(255,255,255,.4);font:12px system-ui,sans-serif;pointer-events:none;z-index:2}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#ff8a80;background:#0a0a0a;padding:24px;text-align:center;z-index:3;font:14px system-ui,sans-serif}
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="c" width="1280" height="720" tabindex="0"></canvas></div>
+<canvas id="c" tabindex="0"></canvas>
 <div id="status">Loading…</div>
 <div id="err"></div>
 <script>
 (function(){
-  const sessionId = %q;
   const wsPath = %q;
   const blockCopy = %s;
   const blockPaste = %s;
   const canvas = document.getElementById('c');
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
   const status = document.getElementById('status');
   const errEl = document.getElementById('err');
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  let ws;
-  let frames = 0;
+  let ws, frames = 0, drawing = false, pendingBitmap = null;
+  let remoteW = 0, remoteH = 0;
+  let lastMove = 0;
+
+  function showErr(msg){
+    errEl.style.display = 'flex';
+    errEl.textContent = msg;
+    status.textContent = '';
+  }
+
+  function cssSize(){
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // CSS pixels of the viewport (remote browser uses the same layout size).
+    const w = Math.max(320, Math.floor(window.innerWidth));
+    const h = Math.max(240, Math.floor(window.innerHeight));
+    return { w, h, dpr };
+  }
+
+  function sendViewport(){
+    if (!ws || ws.readyState !== 1) return;
+    const s = cssSize();
+    ws.send(JSON.stringify({ type: 'viewport', width: s.w, height: s.h, dpr: 1 }));
+  }
+
+  function paintBitmap(bmp){
+    if (drawing) { pendingBitmap = bmp; return; }
+    drawing = true;
+    if (bmp.width && bmp.height && (canvas.width !== bmp.width || canvas.height !== bmp.height)) {
+      canvas.width = bmp.width;
+      canvas.height = bmp.height;
+      remoteW = bmp.width;
+      remoteH = bmp.height;
+    }
+    ctx.drawImage(bmp, 0, 0);
+    if (typeof bmp.close === 'function') bmp.close();
+    frames++;
+    if (frames === 1) status.textContent = '';
+    drawing = false;
+    if (pendingBitmap) {
+      const n = pendingBitmap; pendingBitmap = null; paintBitmap(n);
+    }
+  }
+
+  async function paintArrayBuffer(buf){
+    try {
+      const bmp = await createImageBitmap(new Blob([buf], { type: 'image/jpeg' }));
+      paintBitmap(bmp);
+    } catch (e) {
+      // Fallback for older browsers
+      const blob = new Blob([buf], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        if (img.width && img.height && (canvas.width !== img.width || canvas.height !== img.height)) {
+          canvas.width = img.width; canvas.height = img.height;
+          remoteW = img.width; remoteH = img.height;
+        }
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        frames++;
+        if (frames === 1) status.textContent = '';
+      };
+      img.onerror = () => URL.revokeObjectURL(url);
+      img.src = url;
+    }
+  }
+
   try {
     ws = new WebSocket(proto + '//' + location.host + wsPath);
   } catch (e) {
@@ -246,67 +309,51 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
   }
   ws.binaryType = 'arraybuffer';
 
-  function showErr(msg){
-    errEl.style.display = 'flex';
-    errEl.textContent = msg;
-    status.textContent = '';
-  }
-
   ws.onopen = () => {
-    status.textContent = '';
     canvas.focus();
-    // Request first frame
-    try { ws.send(JSON.stringify({type:'ping'})); } catch(e) {}
+    sendViewport();
   };
-  ws.onclose = () => { if (frames === 0) showErr('Secure session ended before content loaded'); else status.textContent = ''; };
+  ws.onclose = () => { if (frames === 0) showErr('Secure session ended before content loaded'); };
   ws.onerror = () => { if (frames === 0) showErr('Secure session connection failed'); };
 
-  let drawing = false;
-  let pending = null;
-  function paint(dataUrl){
-    pending = dataUrl;
-    if (drawing) return;
-    drawing = true;
-    const img = new Image();
-    img.onload = () => {
-      if (img.width && img.height && (canvas.width !== img.width || canvas.height !== img.height)) {
-        canvas.width = img.width;
-        canvas.height = img.height;
-      }
-      ctx.drawImage(img, 0, 0);
-      frames++;
-      if (frames === 1) status.textContent = '';
-      drawing = false;
-      if (pending && pending !== dataUrl) {
-        const n = pending; pending = null; paint(n);
-      } else {
-        pending = null;
-      }
-    };
-    img.onerror = () => { drawing = false; };
-    img.src = dataUrl;
-  }
-
   ws.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch(e) { return; }
-    if (msg.type === 'frame' && msg.data) {
-      paint('data:image/jpeg;base64,' + msg.data);
-    } else if (msg.type === 'error' && msg.message) {
-      showErr(msg.message);
+    if (ev.data instanceof ArrayBuffer) {
+      paintArrayBuffer(ev.data);
+      return;
     }
+    // legacy JSON frames (base64)
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'frame' && msg.data) {
+        const bin = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+        paintArrayBuffer(bin.buffer);
+      } else if (msg.type === 'error' && msg.message) {
+        showErr(msg.message);
+      }
+    } catch (e) {}
   };
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(sendViewport, 120);
+  });
 
   function sendInput(event){
     if (!ws || ws.readyState !== 1) return;
-    ws.send(JSON.stringify({type:'input', event:event}));
+    ws.send(JSON.stringify({ type: 'input', event: event }));
   }
 
   function relCoords(e){
     const r = canvas.getBoundingClientRect();
-    const sx = canvas.width / Math.max(r.width, 1);
-    const sy = canvas.height / Math.max(r.height, 1);
-    return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy };
+    const w = remoteW || canvas.width || r.width;
+    const h = remoteH || canvas.height || r.height;
+    const sx = w / Math.max(r.width, 1);
+    const sy = h / Math.max(r.height, 1);
+    return {
+      x: Math.max(0, Math.min(w, (e.clientX - r.left) * sx)),
+      y: Math.max(0, Math.min(h, (e.clientY - r.top) * sy))
+    };
   }
 
   function mods(e){
@@ -319,42 +366,39 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
   }
 
   canvas.addEventListener('mousemove', e => {
+    const now = performance.now();
+    if (now - lastMove < 16) return; // ~60Hz cap
+    lastMove = now;
     const p = relCoords(e);
-    sendInput({kind:'mouse', type:'mouseMoved', x:p.x, y:p.y, modifiers:mods(e)});
+    sendInput({ kind: 'mouse', type: 'mouseMoved', x: p.x, y: p.y, modifiers: mods(e) });
   });
   canvas.addEventListener('mousedown', e => {
     e.preventDefault();
     canvas.focus();
     const p = relCoords(e);
     const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
-    sendInput({kind:'mouse', type:'mousePressed', x:p.x, y:p.y, button:button, clickCount:1, modifiers:mods(e)});
+    sendInput({ kind: 'mouse', type: 'mousePressed', x: p.x, y: p.y, button, clickCount: 1, modifiers: mods(e) });
   });
   canvas.addEventListener('mouseup', e => {
     e.preventDefault();
     const p = relCoords(e);
     const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
-    sendInput({kind:'mouse', type:'mouseReleased', x:p.x, y:p.y, button:button, clickCount:1, modifiers:mods(e)});
+    sendInput({ kind: 'mouse', type: 'mouseReleased', x: p.x, y: p.y, button, clickCount: 1, modifiers: mods(e) });
   });
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     const p = relCoords(e);
-    sendInput({kind:'wheel', type:'mouseWheel', x:p.x, y:p.y, deltaX:e.deltaX, deltaY:e.deltaY, modifiers:mods(e)});
-  }, {passive:false});
+    sendInput({ kind: 'wheel', type: 'mouseWheel', x: p.x, y: p.y, deltaX: e.deltaX, deltaY: e.deltaY, modifiers: mods(e) });
+  }, { passive: false });
   canvas.addEventListener('contextmenu', e => e.preventDefault());
 
   window.addEventListener('keydown', e => {
-    if (blockPaste && (e.key === 'v' || e.key === 'V') && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      return;
-    }
-    if (blockCopy && (e.key === 'c' || e.key === 'C' || e.key === 'x' || e.key === 'X') && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      return;
-    }
-    sendInput({kind:'key', type:'keyDown', key:e.key, code:e.code, text:e.key.length===1?e.key:'', modifiers:mods(e)});
+    if (blockPaste && (e.key === 'v' || e.key === 'V') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); return; }
+    if (blockCopy && (e.key === 'c' || e.key === 'C' || e.key === 'x' || e.key === 'X') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); return; }
+    sendInput({ kind: 'key', type: 'keyDown', key: e.key, code: e.code, text: e.key.length === 1 ? e.key : '', modifiers: mods(e) });
   });
   window.addEventListener('keyup', e => {
-    sendInput({kind:'key', type:'keyUp', key:e.key, code:e.code, modifiers:mods(e)});
+    sendInput({ kind: 'key', type: 'keyUp', key: e.key, code: e.code, modifiers: mods(e) });
   });
 
   if (blockCopy || blockPaste) {
@@ -366,7 +410,7 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
 </script>
 </body>
 </html>
-`, htmlEscape(displayTitle(flags.TargetURL)), sessionID, wsPath, blockCopy, blockPaste)
+`, htmlEscape(displayTitle(flags.TargetURL)), wsPath, blockCopy, blockPaste)
 }
 
 func displayTitle(target string) string {
