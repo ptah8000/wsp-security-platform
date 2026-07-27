@@ -43,11 +43,11 @@ VALUES ($1, $2, $3, $4)
 RETURNING id, started_at, ended_at, client_ip, username, user_agent, summary
 `
 	var (
-		out       BrowsingSession
-		endedAt   pgtype.Timestamptz
-		clientIP  pgtype.Text
-		username  pgtype.Text
-		userAgent pgtype.Text
+		out        BrowsingSession
+		endedAt    pgtype.Timestamptz
+		clientIP   pgtype.Text
+		username   pgtype.Text
+		userAgent  pgtype.Text
 		summaryOut []byte
 	)
 	err := s.pool.QueryRow(ctx, q,
