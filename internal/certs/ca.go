@@ -1,11 +1,13 @@
 package certs
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -104,6 +106,8 @@ func (p *Provider) GenerateSelfSignedCA(ctx context.Context, name string) (CertM
 		return CertMeta{}, err
 	}
 
+	// MITM trust-anchor CA: no Extended Key Usage (EKU on a CA confuses some
+	// browsers/NSS path builders). KeyUsage is cert-sign only.
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -112,12 +116,13 @@ func (p *Provider) GenerateSelfSignedCA(ctx context.Context, name string) (CertM
 		},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		MaxPathLen:            0,
 		MaxPathLenZero:        true,
+		// Explicit SKI so leaf AKI matches reliably across store reloads.
+		SubjectKeyId: skiForPublicKey(&priv.PublicKey),
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
@@ -169,6 +174,10 @@ func (p *Provider) GenerateSelfSignedCA(ctx context.Context, name string) (CertM
 		meta.ID = row.ID
 		meta.CreatedAt = row.CreatedAt
 		meta.IsActive = row.IsActive
+	}
+
+	if err := assertSignerMatchesCert(caCert, priv); err != nil {
+		return CertMeta{}, err
 	}
 
 	// Install active CA in memory (bumps generation) and drop leaves signed by any previous CA.
@@ -242,7 +251,13 @@ func (p *Provider) SignHost(host string) (*tls.Certificate, error) {
 		return nil, err
 	}
 
-	// tls.Certificate with leaf + CA for chain presentation.
+	// Defense in depth: never serve a leaf we cannot verify against the CA we send.
+	if err := leaf.Leaf.CheckSignatureFrom(caCert); err != nil {
+		return nil, fmt.Errorf("leaf signature check failed (CA key/cert mismatch?): %w", err)
+	}
+
+	// tls.Certificate: leaf first, then issuing CA (public only).
+	// Clients that already trust this CA verify the leaf; others need the CA installed.
 	tlsCert := &tls.Certificate{
 		Certificate: [][]byte{leaf.Certificate[0], caCert.Raw},
 		PrivateKey:  leaf.PrivateKey,
@@ -298,6 +313,9 @@ func (p *Provider) loadActiveCA(ctx context.Context) error {
 	caCert, caKey, err := parseCAMaterial([]byte(row.CertPEM), keyPEM)
 	if err != nil {
 		return err
+	}
+	if err := assertSignerMatchesCert(caCert, caKey); err != nil {
+		return fmt.Errorf("active CA key/cert mismatch (re-generate CA or check WSP_DATA_KEY): %w", err)
 	}
 
 	// Install only if still empty and generation matches expected; never overwrite a
@@ -446,6 +464,8 @@ func signLeaf(caCert *x509.Certificate, caKey crypto.Signer, host string) (*tls.
 		return nil, time.Time{}, err
 	}
 
+	// ECDSA leaves: digital signature only (KeyEncipherment is RSA-era and can
+	// upset strict validators). ServerAuth EKU required for HTTPS.
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -453,16 +473,18 @@ func signLeaf(caCert *x509.Certificate, caKey crypto.Signer, host string) (*tls.
 		},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
+		SubjectKeyId:          skiForPublicKey(&priv.PublicKey),
 	}
 
 	if ip := net.ParseIP(host); ip != nil {
 		tmpl.IPAddresses = []net.IP{ip}
 	} else {
-		tmpl.DNSNames = []string{host}
+		// Cover bare + www. for typical sites (SAN must match what the browser requests).
+		tmpl.DNSNames = dnsNamesForHost(host)
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &priv.PublicKey, caKey)
@@ -473,12 +495,74 @@ func signLeaf(caCert *x509.Certificate, caKey crypto.Signer, host string) (*tls.
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("parse leaf certificate: %w", err)
 	}
+	if err := leafCert.CheckSignatureFrom(caCert); err != nil {
+		return nil, time.Time{}, fmt.Errorf("created leaf failed signature check: %w", err)
+	}
 
 	return &tls.Certificate{
 		Certificate: [][]byte{der},
 		PrivateKey:  priv,
 		Leaf:        leafCert,
 	}, notAfter, nil
+}
+
+// dnsNamesForHost returns SAN DNS names for a hostname (plus www. / apex pair).
+func dnsNamesForHost(host string) []string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return nil
+	}
+	names := []string{host}
+	if strings.HasPrefix(host, "www.") {
+		apex := strings.TrimPrefix(host, "www.")
+		if apex != "" && apex != host {
+			names = append(names, apex)
+		}
+	} else if strings.Count(host, ".") >= 1 {
+		www := "www." + host
+		names = append(names, www)
+	}
+	return names
+}
+
+// skiForPublicKey builds a Subject Key Identifier (SHA-1 over the SPKI), as
+// commonly used by browsers for AKI/SKI path building.
+func skiForPublicKey(pub crypto.PublicKey) []byte {
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil
+	}
+	sum := sha1.Sum(spki)
+	return sum[:]
+}
+
+func assertSignerMatchesCert(cert *x509.Certificate, key crypto.Signer) error {
+	if cert == nil || key == nil {
+		return errors.New("nil cert or key")
+	}
+	switch pub := cert.PublicKey.(type) {
+	case *ecdsa.PublicKey:
+		priv, ok := key.(*ecdsa.PrivateKey)
+		if !ok {
+			return errors.New("CA cert is ECDSA but key is not")
+		}
+		if !pub.Equal(&priv.PublicKey) {
+			return errors.New("ECDSA public key does not match certificate")
+		}
+	default:
+		want, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+		if err != nil {
+			return err
+		}
+		got, err := x509.MarshalPKIXPublicKey(key.Public())
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(want, got) {
+			return errors.New("public key does not match certificate")
+		}
+	}
+	return nil
 }
 
 func randomSerial() (*big.Int, error) {

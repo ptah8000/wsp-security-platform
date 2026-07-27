@@ -84,11 +84,13 @@ func (s *Server) handleClientSetup(c echo.Context) error {
 			"Windows: certutil -addstore -f ROOT path\\to\\wsp-ca.pem (elevated) then restart the browser.",
 		},
 		"troubleshooting": []string{
-			"NET::ERR_CERT_AUTHORITY_INVALID — client does not trust the WSP CA; re-import public PEM into system or browser trust store.",
-			"Windows curl uses SChannel and may ignore --cacert; use -k for lab tests or import the CA into Windows Trusted Root.",
-			"Proxy connection failed — verify client can reach the published host port (Compose may map host 18080 → container 8080 on Windows).",
+			"NET::ERR_CERT_AUTHORITY_INVALID or SEC_ERROR_UNKNOWN_ISSUER — import the current CA PEM (Client Setup download). Delete any older “WSP Lab CA” entries first.",
+			"SEC_ERROR_BAD_SIGNATURE / “invalid signature” — almost always a STALE CA in the trust store from a previous generate. Remove all WSP CAs, re-download from Client Setup, re-import, restart browser.",
+			"Firefox: Preferences → Certificates → Authorities → Import → trust “identify websites”. Firefox does not use the Windows store by default.",
+			"Windows curl uses SChannel and may ignore --cacert; use -k for lab tests or: certutil -addstore -f ROOT wsp-ca.pem",
+			"Proxy connection failed — verify client can reach the published host port (Compose maps host 18080 → container 8080 on Windows).",
 			"HTTPS sites work without inspection — policy may have tls_intercept=false for that destination.",
-			"Intermittent TLS errors after CA rotation — regenerate/redistribute CA and clear browser TLS state.",
+			"After regenerating the CA, clear leaf TLS state (restart browser) and re-import the new PEM.",
 			"RBI degraded — ensure the Docker socket is mounted and the wsp container has permission (group_add docker/root GID).",
 		},
 	})
