@@ -1,7 +1,7 @@
 # Web Security Platform (WSP) v1 — Design Specification
 
 **Date:** 2026-07-27  
-**Status:** Draft for user review  
+**Status:** Ready for user review  
 **Source of truth for product requirements:** `SECURITY_SUITE_V1_DEVELOPMENT_PROMPT.md`  
 **Working directory:** `D:\Grok\WSP`
 
