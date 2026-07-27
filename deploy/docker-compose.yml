@@ -1,3 +1,13 @@
+# Web Security Platform v1 — single-host Compose stack
+#
+# Quick start:
+#   cp env.example .env
+#   # set WSP_DATA_KEY=$(openssl rand -base64 32)
+#   docker compose up -d --build
+#   ./smoke.sh
+#
+# Ports: proxy 8080, admin 3000. RBI needs the Docker socket mount.
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,15 +18,21 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wsp"]
+      test: ["CMD-SHELL", "pg_isready -U wsp -d wsp"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
     restart: unless-stopped
+    # Lab default: not published. Uncomment to debug from the host:
+    # ports:
+    #   - "5432:5432"
 
   clamav:
     image: clamav/clamav:stable
-    # clamd listens on 3310 inside the compose network (no host publish required)
+    # clamd listens on 3310 on the Compose network only (no host publish).
+    # First start downloads signatures and can take several minutes; wsp malware
+    # defaults to fail-open so the proxy can start before clamd is ready.
     restart: unless-stopped
 
   wsp:
@@ -32,6 +48,7 @@ services:
       - "8080:8080"
       - "3000:3000"
     volumes:
+      # Required for RBI (ephemeral Chromium). Equivalent to host root — see README security notes.
       - /var/run/docker.sock:/var/run/docker.sock
       - wsp_data:/var/lib/wsp
     depends_on:
@@ -39,9 +56,11 @@ services:
         condition: service_healthy
       clamav:
         condition: service_started
-    # clamav may take a long time to load signatures — wsp must retry clamd
-    # No restart: unless-stopped on wsp — avoids thrash if clamd is slow to ready
-    restart: "no"
+    # Prefer restart after crash once DB is up; clam may still be loading (fail-open malware default).
+    restart: unless-stopped
+    # Distroless has no shell/curl. Probe externally with deploy/smoke.sh → GET /healthz.
+    # RBI: socket is often root:docker — if isolation cannot talk to Docker, run with a
+    # matching group_add DOCKER_GID or document host permissions (see README security).
 
 volumes:
   pgdata:

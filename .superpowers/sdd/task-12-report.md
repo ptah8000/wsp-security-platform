@@ -2,7 +2,7 @@
 
 **Status:** DONE  
 **Branch:** `feature/wsp-v1`  
-**Commit:** `b8f45df` — `feat: log retention job and richer health checks`  
+**Commit:** `4c40c1c` — `feat: log retention job and richer health checks`  
 **Author:** WSP Dev \<dev@wsp.local\>  
 **Date:** 2026-07-27
 
