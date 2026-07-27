@@ -94,3 +94,39 @@ func (s *Store) GetSettingRow(ctx context.Context, key string) (Setting, error) 
 	st.Value = json.RawMessage(raw)
 	return st, nil
 }
+
+// ListSettings returns all settings rows ordered by key.
+func (s *Store) ListSettings(ctx context.Context) ([]Setting, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is nil")
+	}
+	const q = `SELECT key, value, updated_at FROM settings ORDER BY key ASC`
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list settings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Setting
+	for rows.Next() {
+		var st Setting
+		var raw []byte
+		if err := rows.Scan(&st.Key, &raw, &st.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan setting: %w", err)
+		}
+		st.Value = json.RawMessage(raw)
+		out = append(out, st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list settings: %w", err)
+	}
+	if out == nil {
+		out = []Setting{}
+	}
+	return out, nil
+}
+
+// MarkSetupComplete sets setup_completed to true.
+func (s *Store) MarkSetupComplete(ctx context.Context) error {
+	return s.SetSetting(ctx, SettingSetupCompleted, json.RawMessage(`true`))
+}

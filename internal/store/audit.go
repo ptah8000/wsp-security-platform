@@ -93,6 +93,84 @@ RETURNING id, ts, actor_user_id, actor_username, action, target_type, target_id,
 	return out, nil
 }
 
+// AuditListFilter constrains ListAuditLogs.
+type AuditListFilter struct {
+	Action string
+	Limit  int
+	Offset int
+}
+
+// ListAuditLogs returns audit entries newest-first.
+func (s *Store) ListAuditLogs(ctx context.Context, f AuditListFilter) ([]AuditEntry, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is nil")
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	const q = `
+SELECT id, ts, actor_user_id, actor_username, action, target_type, target_id, summary, detail, ip
+FROM audit_logs
+WHERE ($1 = '' OR action = $1)
+ORDER BY ts DESC
+LIMIT $2 OFFSET $3
+`
+	rows, err := s.pool.Query(ctx, q, f.Action, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list audit logs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AuditEntry
+	for rows.Next() {
+		var (
+			e         AuditEntry
+			actorUser pgtype.UUID
+			actorName pgtype.Text
+			targetTyp pgtype.Text
+			targetID  pgtype.Text
+			summary   pgtype.Text
+			detailOut []byte
+			ip        pgtype.Text
+		)
+		if err := rows.Scan(
+			&e.ID, &e.TS, &actorUser, &actorName, &e.Action,
+			&targetTyp, &targetID, &summary, &detailOut, &ip,
+		); err != nil {
+			return nil, fmt.Errorf("scan audit log: %w", err)
+		}
+		if actorUser.Valid {
+			id := uuid.UUID(actorUser.Bytes)
+			e.ActorUserID = &id
+		}
+		e.ActorUsername = actorName.String
+		e.TargetType = targetTyp.String
+		e.TargetID = targetID.String
+		e.Summary = summary.String
+		e.IP = ip.String
+		if len(detailOut) > 0 {
+			e.Detail = json.RawMessage(detailOut)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list audit logs: %w", err)
+	}
+	if out == nil {
+		out = []AuditEntry{}
+	}
+	return out, nil
+}
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil

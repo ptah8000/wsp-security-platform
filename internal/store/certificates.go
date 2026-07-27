@@ -180,3 +180,77 @@ WHERE id = $1
 	}
 	return out, nil
 }
+
+// CertificateMeta is public certificate metadata (never includes private key material).
+type CertificateMeta struct {
+	ID                uuid.UUID `json:"id"`
+	Name              string    `json:"name"`
+	Kind              string    `json:"kind"`
+	FingerprintSHA256 string    `json:"fingerprint_sha256"`
+	NotBefore         time.Time `json:"not_before"`
+	NotAfter          time.Time `json:"not_after"`
+	IsActive          bool      `json:"is_active"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// ListCertificates returns public metadata for all certificates (no keys, no PEM by default).
+func (s *Store) ListCertificates(ctx context.Context) ([]CertificateMeta, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is nil")
+	}
+	const q = `
+SELECT id, name, kind, fingerprint_sha256, not_before, not_after, is_active, created_at
+FROM certificates
+ORDER BY is_active DESC, created_at DESC, id ASC
+`
+	rows, err := s.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list certificates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CertificateMeta
+	for rows.Next() {
+		var c CertificateMeta
+		if err := rows.Scan(
+			&c.ID, &c.Name, &c.Kind, &c.FingerprintSHA256,
+			&c.NotBefore, &c.NotAfter, &c.IsActive, &c.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan certificate: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list certificates: %w", err)
+	}
+	if out == nil {
+		out = []CertificateMeta{}
+	}
+	return out, nil
+}
+
+// GetCertificatePublicPEM returns only the public cert_pem for id (never the private key).
+func (s *Store) GetCertificatePublicPEM(ctx context.Context, id uuid.UUID) (certPEM string, meta CertificateMeta, err error) {
+	if s == nil || s.pool == nil {
+		return "", CertificateMeta{}, fmt.Errorf("store is nil")
+	}
+	if id == uuid.Nil {
+		return "", CertificateMeta{}, fmt.Errorf("certificate id is required")
+	}
+	const q = `
+SELECT id, name, kind, cert_pem, fingerprint_sha256, not_before, not_after, is_active, created_at
+FROM certificates
+WHERE id = $1
+`
+	err = s.pool.QueryRow(ctx, q, id).Scan(
+		&meta.ID, &meta.Name, &meta.Kind, &certPEM,
+		&meta.FingerprintSHA256, &meta.NotBefore, &meta.NotAfter, &meta.IsActive, &meta.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", CertificateMeta{}, fmt.Errorf("certificate %s: %w", id, err)
+		}
+		return "", CertificateMeta{}, fmt.Errorf("get certificate pem: %w", err)
+	}
+	return certPEM, meta, nil
+}

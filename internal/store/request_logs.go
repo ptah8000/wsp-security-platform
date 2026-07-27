@@ -105,26 +105,26 @@ RETURNING id, session_id, request_id, ts,
     actions, timings, block_reason, block_page_id, error
 `
 	var (
-		out          RequestLog
-		sessionID    pgtype.UUID
-		clientIP     pgtype.Text
-		username     pgtype.Text
-		userAgent    pgtype.Text
-		method       pgtype.Text
-		scheme       pgtype.Text
-		host         pgtype.Text
-		path         pgtype.Text
-		query        pgtype.Text
-		url          pgtype.Text
-		protocol     pgtype.Text
-		reqSize      pgtype.Int8
-		respSize     pgtype.Int8
-		decision     pgtype.Text
-		actionsOut   []byte
-		timingsOut   []byte
-		blockReason  pgtype.Text
-		blockPageID  pgtype.UUID
-		errText      pgtype.Text
+		out         RequestLog
+		sessionID   pgtype.UUID
+		clientIP    pgtype.Text
+		username    pgtype.Text
+		userAgent   pgtype.Text
+		method      pgtype.Text
+		scheme      pgtype.Text
+		host        pgtype.Text
+		path        pgtype.Text
+		query       pgtype.Text
+		url         pgtype.Text
+		protocol    pgtype.Text
+		reqSize     pgtype.Int8
+		respSize    pgtype.Int8
+		decision    pgtype.Text
+		actionsOut  []byte
+		timingsOut  []byte
+		blockReason pgtype.Text
+		blockPageID pgtype.UUID
+		errText     pgtype.Text
 	)
 
 	err := s.pool.QueryRow(ctx, q,
@@ -295,6 +295,236 @@ LIMIT 1
 			return RequestLog{}, fmt.Errorf("request log %s: %w", requestID, err)
 		}
 		return RequestLog{}, fmt.Errorf("get request log: %w", err)
+	}
+	if sessionID.Valid {
+		id := uuid.UUID(sessionID.Bytes)
+		out.SessionID = &id
+	}
+	out.ClientIP = clientIP.String
+	out.Username = username.String
+	out.UserAgent = userAgent.String
+	out.Method = method.String
+	out.Scheme = scheme.String
+	out.Host = host.String
+	out.Path = path.String
+	out.Query = query.String
+	out.URL = url.String
+	out.Protocol = protocol.String
+	if reqSize.Valid {
+		v := reqSize.Int64
+		out.RequestSize = &v
+	}
+	if respSize.Valid {
+		v := respSize.Int64
+		out.ResponseSize = &v
+	}
+	out.Decision = decision.String
+	if out.MatchedRuleIDs == nil {
+		out.MatchedRuleIDs = []uuid.UUID{}
+	}
+	if out.EvaluatedRuleIDs == nil {
+		out.EvaluatedRuleIDs = []uuid.UUID{}
+	}
+	if len(actionsOut) > 0 {
+		out.Actions = json.RawMessage(actionsOut)
+	}
+	if len(timingsOut) > 0 {
+		out.Timings = json.RawMessage(timingsOut)
+	}
+	out.BlockReason = blockReason.String
+	if blockPageID.Valid {
+		id := uuid.UUID(blockPageID.Bytes)
+		out.BlockPageID = &id
+	}
+	out.Error = errText.String
+	return out, nil
+}
+
+// RequestLogFilter constrains SearchRequestLogs.
+type RequestLogFilter struct {
+	ClientIP  string
+	Username  string
+	Host      string
+	Decision  string
+	SessionID *uuid.UUID
+	Since     *time.Time
+	Until     *time.Time
+	Limit     int
+	Offset    int
+}
+
+// SearchRequestLogs returns request logs matching filters, newest-first.
+func (s *Store) SearchRequestLogs(ctx context.Context, f RequestLogFilter) ([]RequestLog, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is nil")
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	const q = `
+SELECT id, session_id, request_id, ts,
+    client_ip, username, user_agent,
+    method, scheme, host, path, query, url, protocol,
+    request_size, response_size,
+    decision, matched_rule_ids, evaluated_rule_ids,
+    actions, timings, block_reason, block_page_id, error
+FROM request_logs
+WHERE ($1 = '' OR client_ip = $1)
+  AND ($2 = '' OR username = $2)
+  AND ($3 = '' OR host ILIKE '%' || $3 || '%')
+  AND ($4 = '' OR decision = $4)
+  AND ($5::uuid IS NULL OR session_id = $5)
+  AND ($6::timestamptz IS NULL OR ts >= $6)
+  AND ($7::timestamptz IS NULL OR ts <= $7)
+ORDER BY ts DESC
+LIMIT $8 OFFSET $9
+`
+	rows, err := s.pool.Query(ctx, q,
+		f.ClientIP,
+		f.Username,
+		f.Host,
+		f.Decision,
+		f.SessionID,
+		f.Since,
+		f.Until,
+		limit,
+		offset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search request logs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []RequestLog
+	for rows.Next() {
+		rec, err := scanRequestLog(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("search request logs: %w", err)
+	}
+	if out == nil {
+		out = []RequestLog{}
+	}
+	return out, nil
+}
+
+// ListRequestLogsBySession returns logs for a browsing session, oldest-first.
+func (s *Store) ListRequestLogsBySession(ctx context.Context, sessionID uuid.UUID, limit int) ([]RequestLog, error) {
+	if s == nil || s.pool == nil {
+		return nil, fmt.Errorf("store is nil")
+	}
+	if sessionID == uuid.Nil {
+		return nil, fmt.Errorf("session id is required")
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	const q = `
+SELECT id, session_id, request_id, ts,
+    client_ip, username, user_agent,
+    method, scheme, host, path, query, url, protocol,
+    request_size, response_size,
+    decision, matched_rule_ids, evaluated_rule_ids,
+    actions, timings, block_reason, block_page_id, error
+FROM request_logs
+WHERE session_id = $1
+ORDER BY ts ASC
+LIMIT $2
+`
+	rows, err := s.pool.Query(ctx, q, sessionID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list request logs by session: %w", err)
+	}
+	defer rows.Close()
+
+	var out []RequestLog
+	for rows.Next() {
+		rec, err := scanRequestLog(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list request logs by session: %w", err)
+	}
+	if out == nil {
+		out = []RequestLog{}
+	}
+	return out, nil
+}
+
+type scannable interface {
+	Scan(dest ...any) error
+}
+
+func scanRequestLog(row scannable) (RequestLog, error) {
+	var (
+		out         RequestLog
+		sessionID   pgtype.UUID
+		clientIP    pgtype.Text
+		username    pgtype.Text
+		userAgent   pgtype.Text
+		method      pgtype.Text
+		scheme      pgtype.Text
+		host        pgtype.Text
+		path        pgtype.Text
+		query       pgtype.Text
+		url         pgtype.Text
+		protocol    pgtype.Text
+		reqSize     pgtype.Int8
+		respSize    pgtype.Int8
+		decision    pgtype.Text
+		actionsOut  []byte
+		timingsOut  []byte
+		blockReason pgtype.Text
+		blockPageID pgtype.UUID
+		errText     pgtype.Text
+	)
+	err := row.Scan(
+		&out.ID,
+		&sessionID,
+		&out.RequestID,
+		&out.TS,
+		&clientIP,
+		&username,
+		&userAgent,
+		&method,
+		&scheme,
+		&host,
+		&path,
+		&query,
+		&url,
+		&protocol,
+		&reqSize,
+		&respSize,
+		&decision,
+		&out.MatchedRuleIDs,
+		&out.EvaluatedRuleIDs,
+		&actionsOut,
+		&timingsOut,
+		&blockReason,
+		&blockPageID,
+		&errText,
+	)
+	if err != nil {
+		return RequestLog{}, fmt.Errorf("scan request log: %w", err)
 	}
 	if sessionID.Valid {
 		id := uuid.UUID(sessionID.Bytes)

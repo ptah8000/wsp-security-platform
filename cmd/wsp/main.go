@@ -11,12 +11,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wsp-security/wsp/internal/audit"
 	"github.com/wsp-security/wsp/internal/auth"
 	"github.com/wsp-security/wsp/internal/casb"
 	"github.com/wsp-security/wsp/internal/certs"
 	"github.com/wsp-security/wsp/internal/config"
+	"github.com/wsp-security/wsp/internal/health"
 	"github.com/wsp-security/wsp/internal/logging"
 	"github.com/wsp-security/wsp/internal/malware"
+	"github.com/wsp-security/wsp/internal/mgmt"
+	"github.com/wsp-security/wsp/internal/policy"
 	"github.com/wsp-security/wsp/internal/proxy"
 	"github.com/wsp-security/wsp/internal/rbi"
 	"github.com/wsp-security/wsp/internal/store"
@@ -75,6 +79,8 @@ func setupLogger(level string) {
 }
 
 func run(ctx context.Context, cfg config.Config) error {
+	startedAt := time.Now().UTC()
+
 	dbCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
@@ -94,35 +100,28 @@ func run(ctx context.Context, cfg config.Config) error {
 	slog.Info("migrations applied", "setup_complete", complete)
 
 	startProxy := cfg.Mode == "all" || cfg.Mode == "gateway"
-	// Management plane is wired in a later task.
-	if cfg.Mode == "management" {
-		slog.Info("management mode: proxy not started; admin API not yet wired")
-		<-ctx.Done()
-		return nil
-	}
+	startMgmt := cfg.Mode == "all" || cfg.Mode == "management"
 
-	if !startProxy {
-		slog.Info("no listeners for mode", "mode", cfg.Mode)
-		<-ctx.Done()
-		return nil
-	}
-
-	engine, err := proxy.LoadEngineFromStore(dbCtx, st)
-	if err != nil {
-		slog.Warn("policy load failed; using empty engine (default allow)", "err", err)
-		engine = nil
-	} else {
-		slog.Info("policy engine loaded from store")
+	// Shared policy engine so management policy writes can hot-swap the gateway.
+	var engine *policy.Engine
+	if startProxy || startMgmt {
+		eng, err := proxy.LoadEngineFromStore(dbCtx, st)
+		if err != nil {
+			slog.Warn("policy load failed; using empty engine (default allow)", "err", err)
+			engine = &policy.Engine{}
+		} else {
+			engine = eng
+			slog.Info("policy engine loaded from store")
+		}
 	}
 
 	var certProvider *certs.Provider
 	if cfg.DataKey != "" {
 		cp, err := certs.NewProvider(st, cfg.DataKey)
 		if err != nil {
-			slog.Warn("certs provider init failed; MITM unavailable", "err", err)
+			slog.Warn("certs provider init failed; MITM/CA unavailable", "err", err)
 		} else {
 			certProvider = cp
-			// Warm active CA into memory if present.
 			if _, ok, err := certProvider.ActiveCA(dbCtx); err != nil {
 				slog.Warn("load active CA", "err", err)
 			} else if ok {
@@ -135,9 +134,6 @@ func run(ctx context.Context, cfg config.Config) error {
 		slog.Warn("WSP_DATA_KEY not set; MITM cert provider disabled")
 	}
 
-	rec := logging.NewRecorder(st)
-	authCache := auth.NewProxyAuthCache(st, 8*time.Hour)
-
 	clam := malware.NewClamd(cfg.ClamdAddr)
 	// Best-effort ping at startup (clamd may still be loading signatures).
 	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -149,32 +145,78 @@ func run(ctx context.Context, cfg config.Config) error {
 	}
 	pingCancel()
 
-	casbAdapter := casb.NewProxyAdapter()
-	slog.Info("CASB catalog loaded", "detectors", len(casbAdapter.Inner.Detectors()))
-
 	rbiOrch := initRBI(cfg)
 
-	srv := &proxy.Server{
-		Addr:              cfg.ProxyAddr,
-		Engine:            engine,
-		Certs:             certProvider,
-		Store:             st,
-		Recorder:          rec,
-		AuthCache:         authCache,
-		Sessions:          proxy.NewSessionTracker(st, proxy.DefaultSessionIdle),
-		CASB:              casbAdapter,
-		Malware:           clam,
-		MalwareFailClosed: cfg.MalwareFailClosed,
-		RBI:               rbiOrch,
+	errc := make(chan error, 2)
+	var proxySrv *proxy.Server
+
+	if startProxy {
+		rec := logging.NewRecorder(st)
+		authCache := auth.NewProxyAuthCache(st, 8*time.Hour)
+		casbAdapter := casb.NewProxyAdapter()
+		slog.Info("CASB catalog loaded", "detectors", len(casbAdapter.Inner.Detectors()))
+
+		proxySrv = &proxy.Server{
+			Addr:              cfg.ProxyAddr,
+			Engine:            engine,
+			Certs:             certProvider,
+			Store:             st,
+			Recorder:          rec,
+			AuthCache:         authCache,
+			Sessions:          proxy.NewSessionTracker(st, proxy.DefaultSessionIdle),
+			CASB:              casbAdapter,
+			Malware:           clam,
+			MalwareFailClosed: cfg.MalwareFailClosed,
+			RBI:               rbiOrch,
+		}
+		go func() {
+			errc <- proxySrv.Start(ctx)
+		}()
+		slog.Info("gateway ready", "proxy_addr", cfg.ProxyAddr, "mode", cfg.Mode,
+			"rbi_image", cfg.RBIImage, "max_rbi_sessions", cfg.MaxRBISessions)
 	}
 
-	errc := make(chan error, 1)
-	go func() {
-		errc <- srv.Start(ctx)
-	}()
+	if startMgmt {
+		sessions := auth.NewSessionManager(st, auth.DefaultAdminSessionTTL)
+		hc := &health.Checker{
+			Version:   Version,
+			StartedAt: startedAt,
+			PingDB:    st.Ping,
+			PingClam:  clam.Ping,
+			PingDocker: func(ctx context.Context) error {
+				if rbiOrch == nil || rbiOrch.Runtime == nil {
+					return fmt.Errorf("rbi runtime not configured")
+				}
+				return rbiOrch.Runtime.Ping(ctx)
+			},
+			RBIActiveCount: rbiOrch.ActiveCount,
+			GatewayListening: func() bool {
+				return startProxy
+			},
+		}
+		mgmtSrv := mgmt.New(mgmt.Deps{
+			Store:        st,
+			Sessions:     sessions,
+			Certs:        certProvider,
+			Engine:       engine,
+			Audit:        audit.New(st),
+			Health:       hc,
+			AdminAddr:    cfg.AdminAddr,
+			ProxyAddr:    cfg.ProxyAddr,
+			SecureCookie: false, // lab default; enable when TLS terminates at admin
+			Version:      Version,
+		})
+		go func() {
+			errc <- mgmtSrv.Start(ctx, cfg.AdminAddr)
+		}()
+		slog.Info("management API ready", "admin_addr", cfg.AdminAddr, "mode", cfg.Mode)
+	}
 
-	slog.Info("gateway ready", "proxy_addr", cfg.ProxyAddr, "mode", cfg.Mode,
-		"rbi_image", cfg.RBIImage, "max_rbi_sessions", cfg.MaxRBISessions)
+	if !startProxy && !startMgmt {
+		slog.Info("no listeners for mode", "mode", cfg.Mode)
+		<-ctx.Done()
+		return nil
+	}
 
 	select {
 	case <-ctx.Done():
@@ -183,12 +225,25 @@ func run(ctx context.Context, cfg config.Config) error {
 		if rbiOrch != nil {
 			rbiOrch.StopAll(shutdownCtx)
 		}
-		_ = srv.Shutdown(shutdownCtx)
-		if err := <-errc; err != nil {
-			return err
+		if proxySrv != nil {
+			_ = proxySrv.Shutdown(shutdownCtx)
+		}
+		// Drain started listeners.
+		n := 0
+		if startProxy {
+			n++
+		}
+		if startMgmt {
+			n++
+		}
+		var first error
+		for i := 0; i < n; i++ {
+			if err := <-errc; err != nil && first == nil {
+				first = err
+			}
 		}
 		slog.Info("wsp stopped")
-		return nil
+		return first
 	case err := <-errc:
 		return err
 	}
