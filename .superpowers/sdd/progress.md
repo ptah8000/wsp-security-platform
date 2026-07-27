@@ -12,3 +12,7 @@ Task 3: complete (commits ec3bec8..ce4a27c, review clean after fixes)
 
 Task 4: complete (commit fe9f6cc, self-signed CA + MITM leaf cache)
 
+Task 4: complete (commits ce4a27c..330642d, review clean after fixes)
+
+Task 5: complete (commit 53523b4, pure ordered policy engine + simulator)
+
