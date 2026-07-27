@@ -31,6 +31,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ClamdAddr != "clamav:3310" {
 		t.Errorf("ClamdAddr = %q, want clamav:3310", cfg.ClamdAddr)
 	}
+	if cfg.MalwareFailClosed {
+		t.Errorf("MalwareFailClosed = true, want false (fail-open default)")
+	}
 	if cfg.DockerHost != "unix:///var/run/docker.sock" {
 		t.Errorf("DockerHost = %q, want unix:///var/run/docker.sock", cfg.DockerHost)
 	}
@@ -82,6 +85,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("WSP_DATABASE_URL", "postgres://u:p@db:5432/wsp?sslmode=disable")
 	t.Setenv("WSP_DATA_KEY", "test-key")
 	t.Setenv("WSP_CLAMD_ADDR", "127.0.0.1:3310")
+	t.Setenv("WSP_MALWARE_FAIL_CLOSED", "true")
 	t.Setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
 	t.Setenv("WSP_RBI_IMAGE", "custom/chrome:1")
 	t.Setenv("WSP_MAX_RBI_SESSIONS", "25")
@@ -108,6 +112,9 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.ClamdAddr != "127.0.0.1:3310" {
 		t.Errorf("ClamdAddr = %q, want 127.0.0.1:3310", cfg.ClamdAddr)
 	}
+	if !cfg.MalwareFailClosed {
+		t.Errorf("MalwareFailClosed = false, want true")
+	}
 	if cfg.DockerHost != "tcp://127.0.0.1:2375" {
 		t.Errorf("DockerHost = %q, want tcp://127.0.0.1:2375", cfg.DockerHost)
 	}
@@ -125,6 +132,37 @@ func TestLoadOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadMalwareFailClosedValues(t *testing.T) {
+	truthy := []string{"1", "true", "TRUE", "yes", "on"}
+	falsey := []string{"0", "false", "no", "off"}
+	for _, v := range truthy {
+		t.Run("true_"+v, func(t *testing.T) {
+			clearWSPEnv(t)
+			t.Setenv("WSP_MALWARE_FAIL_CLOSED", v)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.MalwareFailClosed {
+				t.Fatalf("MalwareFailClosed false for %q", v)
+			}
+		})
+	}
+	for _, v := range falsey {
+		t.Run("false_"+v, func(t *testing.T) {
+			clearWSPEnv(t)
+			t.Setenv("WSP_MALWARE_FAIL_CLOSED", v)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.MalwareFailClosed {
+				t.Fatalf("MalwareFailClosed true for %q", v)
+			}
+		})
+	}
+}
+
 func clearWSPEnv(t *testing.T) {
 	t.Helper()
 	keys := []string{
@@ -134,6 +172,7 @@ func clearWSPEnv(t *testing.T) {
 		"WSP_DATABASE_URL",
 		"WSP_DATA_KEY",
 		"WSP_CLAMD_ADDR",
+		"WSP_MALWARE_FAIL_CLOSED",
 		"DOCKER_HOST",
 		"WSP_RBI_IMAGE",
 		"WSP_MAX_RBI_SESSIONS",

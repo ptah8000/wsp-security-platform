@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/wsp-security/wsp/internal/auth"
 	"github.com/wsp-security/wsp/internal/certs"
 	"github.com/wsp-security/wsp/internal/logging"
+	"github.com/wsp-security/wsp/internal/malware"
 	"github.com/wsp-security/wsp/internal/policy"
 	"github.com/wsp-security/wsp/internal/store"
 )
@@ -38,8 +38,13 @@ type Server struct {
 
 	// Optional pipeline hooks (default to no-op stubs).
 	CASB    CASBInspector
-	Malware MalwareScanner
+	Malware malware.Scanner
 	RBI     RBIOrchestrator
+
+	// MalwareFailClosed blocks on scan errors when true (default false = fail-open).
+	MalwareFailClosed bool
+	// MalwareMaxBytes caps scanned body size; 0 uses malware.DefaultMaxScanBytes.
+	MalwareMaxBytes int64
 
 	// Dialer / Transport for origin connections (tests may inject).
 	Dialer    *net.Dialer
@@ -237,6 +242,28 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Request-body malware scan (uploads) when policy enables it.
+	reqSize := req.ContentLength
+	if d.MalwareScan && req.Body != nil && req.Body != http.NoBody {
+		out := s.scanHTTPBody(req.Context(), req.Body, req.ContentLength)
+		req.Body = out.Body
+		// Only rewrite Content-Length when the body was fully buffered (not oversize pass-through).
+		if out.ErrMsg != "malware_skipped_oversize" && out.Size >= 0 && req.Body != http.NoBody {
+			req.ContentLength = out.Size
+			req.Header.Set("Content-Length", fmt.Sprintf("%d", out.Size))
+			req.Header.Del("Transfer-Encoding")
+			reqSize = out.Size
+		}
+		if out.BlockReason != "" {
+			d.FinalAction = policy.ActionBlock
+			d.BlockReason = out.BlockReason
+			pr.Decision = d
+			n := s.writeBlockPage(w, req, d, clientIPStr, username, target)
+			s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), out.ErrMsg)
+			return
+		}
+	}
+
 	applyRequestHeaderMods(req, d.HeaderMods)
 	stripHopByHop(req.Header)
 	req.Header.Del("Proxy-Authorization")
@@ -252,7 +279,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	resp, err := s.Transport.RoundTrip(outReq)
 	if err != nil {
 		http.Error(w, "Bad Gateway: "+err.Error(), http.StatusBadGateway)
-		s.recordOutcome(req.Context(), pr, req, target, "error", req.ContentLength, 0, err.Error())
+		s.recordOutcome(req.Context(), pr, req, target, "error", reqSize, 0, err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -264,12 +291,28 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		d.BlockReason = reason
 		pr.Decision = d
 		n := s.writeBlockPage(w, req, d, clientIPStr, username, target)
-		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(n), "")
+		s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), "")
 		return
 	}
 
+	// Response-body malware scan when policy enables it.
 	if d.MalwareScan {
-		_, _ = s.Malware.Scan(req.Context(), strings.NewReader(""), 0)
+		out := s.scanHTTPBody(req.Context(), resp.Body, resp.ContentLength)
+		resp.Body = out.Body
+		if out.Size > 0 && out.ErrMsg != "malware_skipped_oversize" {
+			resp.ContentLength = out.Size
+			resp.Header.Set("Content-Length", fmt.Sprintf("%d", out.Size))
+			// Body is fully buffered; clear chunked TE if present.
+			resp.Header.Del("Transfer-Encoding")
+		}
+		if out.BlockReason != "" {
+			d.FinalAction = policy.ActionBlock
+			d.BlockReason = out.BlockReason
+			pr.Decision = d
+			n := s.writeBlockPage(w, req, d, clientIPStr, username, target)
+			s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), out.ErrMsg)
+			return
+		}
 	}
 
 	applyResponseHeaderMods(resp, d.HeaderMods)
@@ -286,5 +329,5 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	if copyErr != nil {
 		errMsg = copyErr.Error()
 	}
-	s.recordOutcome(req.Context(), pr, req, target, "allow", req.ContentLength, n, errMsg)
+	s.recordOutcome(req.Context(), pr, req, target, "allow", reqSize, n, errMsg)
 }

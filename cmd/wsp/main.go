@@ -15,6 +15,7 @@ import (
 	"github.com/wsp-security/wsp/internal/certs"
 	"github.com/wsp-security/wsp/internal/config"
 	"github.com/wsp-security/wsp/internal/logging"
+	"github.com/wsp-security/wsp/internal/malware"
 	"github.com/wsp-security/wsp/internal/proxy"
 	"github.com/wsp-security/wsp/internal/store"
 	_ "github.com/wsp-security/wsp/web" // embed admin UI assets (placeholder in v1 scaffold)
@@ -135,14 +136,27 @@ func run(ctx context.Context, cfg config.Config) error {
 	rec := logging.NewRecorder(st)
 	authCache := auth.NewProxyAuthCache(st, 8*time.Hour)
 
+	clam := malware.NewClamd(cfg.ClamdAddr)
+	// Best-effort ping at startup (clamd may still be loading signatures).
+	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := clam.Ping(pingCtx); err != nil {
+		slog.Warn("clamd not ready at startup; scans will retry per request",
+			"addr", cfg.ClamdAddr, "err", err, "malware_fail_closed", cfg.MalwareFailClosed)
+	} else {
+		slog.Info("clamd ping ok", "addr", cfg.ClamdAddr)
+	}
+	pingCancel()
+
 	srv := &proxy.Server{
-		Addr:      cfg.ProxyAddr,
-		Engine:    engine,
-		Certs:     certProvider,
-		Store:     st,
-		Recorder:  rec,
-		AuthCache: authCache,
-		Sessions:  proxy.NewSessionTracker(st, proxy.DefaultSessionIdle),
+		Addr:              cfg.ProxyAddr,
+		Engine:            engine,
+		Certs:             certProvider,
+		Store:             st,
+		Recorder:          rec,
+		AuthCache:         authCache,
+		Sessions:          proxy.NewSessionTracker(st, proxy.DefaultSessionIdle),
+		Malware:           clam,
+		MalwareFailClosed: cfg.MalwareFailClosed,
 	}
 
 	errc := make(chan error, 1)

@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,8 +14,223 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/wsp-security/wsp/internal/logging"
+	"github.com/wsp-security/wsp/internal/malware"
 	"github.com/wsp-security/wsp/internal/policy"
 )
+
+// stubScanner is a malware.Scanner for pipeline tests.
+type stubScanner struct {
+	threat  string
+	err     error
+	skipped bool
+	calls   int
+}
+
+func (s *stubScanner) Ping(context.Context) error { return nil }
+
+func (s *stubScanner) Scan(_ context.Context, r io.Reader, maxBytes int64) (malware.Result, error) {
+	s.calls++
+	if s.err != nil {
+		return malware.Result{Error: s.err}, s.err
+	}
+	if s.skipped {
+		return malware.Result{Skipped: true}, nil
+	}
+	if s.threat != "" {
+		// Drain reader like a real scanner.
+		_, _ = io.Copy(io.Discard, io.LimitReader(r, maxBytes))
+		return malware.Result{Infected: true, Signature: s.threat}, nil
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(r, maxBytes))
+	return malware.Result{}, nil
+}
+
+func TestMalwareScan_BlocksInfectedResponse(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR"))
+	}))
+	t.Cleanup(origin.Close)
+
+	rules := []policy.Rule{{
+		ID:       uuid.MustParse("00000000-0000-4000-8000-0000000000b1"),
+		Name:     "malware-on",
+		Enabled:  true,
+		Priority: 1,
+		Sections: policy.RuleSections{
+			General:     policy.GeneralSection{Action: policy.ActionAllow, AuthMode: policy.AuthDisable},
+			Antimalware: policy.AntimalwareSection{Enabled: true},
+		},
+	}}
+	snap, err := policy.Compile(rules, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eng policy.Engine
+	eng.Swap(snap)
+
+	scan := &stubScanner{threat: "Eicar-Test-Signature"}
+	rec := logging.NewRecorder(nil)
+	srv := &Server{
+		Engine:   &eng,
+		Recorder: rec,
+		Malware:  scan,
+	}
+
+	target, _ := url.Parse(origin.URL + "/eicar")
+	req := httptest.NewRequest(http.MethodGet, target.String(), nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.RequestURI = target.String()
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d want 403", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "Malware detected") || !strings.Contains(rr.Body.String(), "Eicar-Test-Signature") {
+		t.Fatalf("body=%q", rr.Body.String())
+	}
+	if scan.calls < 1 {
+		t.Fatal("expected scanner to be called")
+	}
+	last, ok := rec.Last()
+	if !ok || last.Decision != "block" {
+		t.Fatalf("log=%+v ok=%v", last, ok)
+	}
+	if last.Error != "malware_detected" {
+		t.Fatalf("error field=%q", last.Error)
+	}
+}
+
+func TestMalwareScan_FailOpenOnError(t *testing.T) {
+	originHit := false
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originHit = true
+		_, _ = w.Write([]byte("clean-body"))
+	}))
+	t.Cleanup(origin.Close)
+
+	rules := []policy.Rule{{
+		ID:       uuid.MustParse("00000000-0000-4000-8000-0000000000b2"),
+		Name:     "malware-on",
+		Enabled:  true,
+		Priority: 1,
+		Sections: policy.RuleSections{
+			General:     policy.GeneralSection{Action: policy.ActionAllow, AuthMode: policy.AuthDisable},
+			Antimalware: policy.AntimalwareSection{Enabled: true},
+		},
+	}}
+	snap, err := policy.Compile(rules, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eng policy.Engine
+	eng.Swap(snap)
+
+	scan := &stubScanner{err: errors.New("clamd down")}
+	rec := logging.NewRecorder(nil)
+	srv := &Server{
+		Engine:            &eng,
+		Recorder:          rec,
+		Malware:           scan,
+		MalwareFailClosed: false,
+	}
+
+	target, _ := url.Parse(origin.URL + "/ok")
+	req := httptest.NewRequest(http.MethodGet, target.String(), nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.RequestURI = target.String()
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	if !originHit {
+		t.Fatal("origin should be contacted (fail-open after response)")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (fail-open)", rr.Code)
+	}
+	if rr.Body.String() != "clean-body" {
+		t.Fatalf("body=%q", rr.Body.String())
+	}
+}
+
+func TestMalwareScan_FailClosedOnError(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("clean-body"))
+	}))
+	t.Cleanup(origin.Close)
+
+	rules := []policy.Rule{{
+		ID:       uuid.MustParse("00000000-0000-4000-8000-0000000000b3"),
+		Name:     "malware-on",
+		Enabled:  true,
+		Priority: 1,
+		Sections: policy.RuleSections{
+			General:     policy.GeneralSection{Action: policy.ActionAllow, AuthMode: policy.AuthDisable},
+			Antimalware: policy.AntimalwareSection{Enabled: true},
+		},
+	}}
+	snap, err := policy.Compile(rules, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eng policy.Engine
+	eng.Swap(snap)
+
+	scan := &stubScanner{err: errors.New("clamd down")}
+	rec := logging.NewRecorder(nil)
+	srv := &Server{
+		Engine:            &eng,
+		Recorder:          rec,
+		Malware:           scan,
+		MalwareFailClosed: true,
+	}
+
+	target, _ := url.Parse(origin.URL + "/ok")
+	req := httptest.NewRequest(http.MethodGet, target.String(), nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.RequestURI = target.String()
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d want 403 (fail-closed)", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "Malware scan unavailable") {
+		t.Fatalf("body=%q", rr.Body.String())
+	}
+	last, ok := rec.Last()
+	if !ok || last.Decision != "block" {
+		t.Fatalf("log=%+v", last)
+	}
+}
+
+func TestMalwareScan_NotCalledWhenPolicyDisabled(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(origin.Close)
+
+	scan := &stubScanner{threat: "should-not-matter"}
+	srv := &Server{Malware: scan}
+
+	target, _ := url.Parse(origin.URL + "/")
+	req := httptest.NewRequest(http.MethodGet, target.String(), nil)
+	req.RemoteAddr = "127.0.0.1:1"
+	req.RequestURI = target.String()
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	if scan.calls != 0 {
+		t.Fatalf("scanner called %d times; policy MalwareScan is false", scan.calls)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d", rr.Code)
+	}
+}
 
 func TestStripHopByHop_ConnectionTokens(t *testing.T) {
 	h := make(http.Header)

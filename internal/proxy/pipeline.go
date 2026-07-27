@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -16,6 +18,7 @@ import (
 	"github.com/wsp-security/wsp/internal/auth"
 	"github.com/wsp-security/wsp/internal/blockpage"
 	"github.com/wsp-security/wsp/internal/logging"
+	"github.com/wsp-security/wsp/internal/malware"
 	"github.com/wsp-security/wsp/internal/policy"
 )
 
@@ -26,12 +29,6 @@ type CASBInspector interface {
 	// InspectRequest returns a block reason when the request should be denied.
 	InspectRequest(ctx context.Context, req *http.Request, d policy.Decision) (blockReason string, err error)
 	InspectResponse(ctx context.Context, req *http.Request, resp *http.Response, d policy.Decision) (blockReason string, err error)
-}
-
-// MalwareScanner scans bodies when policy enables malware scanning.
-type MalwareScanner interface {
-	// Scan returns threat name when malicious; empty string means clean/skipped.
-	Scan(ctx context.Context, r io.Reader, maxBytes int64) (threat string, err error)
 }
 
 // RBIOrchestrator hands off isolated browsing (stub no-op in v1 skeleton).
@@ -52,11 +49,6 @@ func (noopCASB) InspectRequest(context.Context, *http.Request, policy.Decision) 
 func (noopCASB) InspectResponse(context.Context, *http.Request, *http.Response, policy.Decision) (string, error) {
 	return "", nil
 }
-
-// noopMalware is the default malware stub.
-type noopMalware struct{}
-
-func (noopMalware) Scan(context.Context, io.Reader, int64) (string, error) { return "", nil }
 
 // noopRBI is the default RBI stub (never isolates).
 type noopRBI struct{}
@@ -347,7 +339,7 @@ func (s *Server) ensureHooks() {
 			s.CASB = noopCASB{}
 		}
 		if s.Malware == nil {
-			s.Malware = noopMalware{}
+			s.Malware = malware.Nop{}
 		}
 		if s.RBI == nil {
 			s.RBI = noopRBI{}
@@ -397,4 +389,125 @@ func decisionLabel(d policy.Decision, override string) string {
 		return string(policy.ActionBlock)
 	}
 	return string(policy.ActionAllow)
+}
+
+// malwareScanOutcome is the result of buffering + scanning a body.
+type malwareScanOutcome struct {
+	// Body is a replacement ReadCloser with the buffered content (and any unread tail).
+	Body io.ReadCloser
+	// Size is the number of bytes buffered for scanning (not including un-scanned tail).
+	Size int64
+	// BlockReason is non-empty when the request/response must be blocked.
+	BlockReason string
+	// ErrMsg is recorded in request logs (scan error detail or empty).
+	ErrMsg string
+}
+
+// scanHTTPBody buffers up to maxBytes, scans via Malware, and returns a
+// replacement body for forwarding. When Content-Length exceeds the cap the
+// body is not scanned (fail-open on size). Scan transport errors honor
+// MalwareFailClosed.
+func (s *Server) scanHTTPBody(ctx context.Context, body io.ReadCloser, contentLength int64) malwareScanOutcome {
+	maxBytes := s.malwareMaxBytes()
+	if body == nil {
+		return malwareScanOutcome{Body: http.NoBody}
+	}
+
+	// Oversized known length: skip scan, pass body through unchanged.
+	if contentLength > 0 && contentLength > maxBytes {
+		slog.Debug("malware scan skipped: content-length exceeds max",
+			"content_length", contentLength, "max_bytes", maxBytes)
+		return malwareScanOutcome{Body: body, ErrMsg: "malware_skipped_oversize"}
+	}
+
+	// Read up to maxBytes+1 to detect unknown-length overflow.
+	limited := io.LimitReader(body, maxBytes+1)
+	buf, err := io.ReadAll(limited)
+	if err != nil {
+		_ = body.Close()
+		reason := ""
+		errMsg := "malware_buffer: " + err.Error()
+		if s != nil && s.MalwareFailClosed {
+			reason = "Malware scan failed (unable to read body)"
+		} else {
+			slog.Error("malware body buffer failed (fail-open)", "err", err)
+		}
+		return malwareScanOutcome{Body: io.NopCloser(bytes.NewReader(nil)), ErrMsg: errMsg, BlockReason: reason}
+	}
+
+	var tail io.Reader
+	oversize := int64(len(buf)) > maxBytes
+	if oversize {
+		// Keep first maxBytes for potential pass-through; rest stays on body.
+		head := buf[:maxBytes]
+		restFirst := buf[maxBytes:] // 1 peek byte
+		tail = io.MultiReader(bytes.NewReader(restFirst), body)
+		buf = head
+		slog.Debug("malware scan skipped: body exceeds max bytes", "max_bytes", maxBytes)
+		newBody := &multiReadCloser{
+			r:     io.MultiReader(bytes.NewReader(buf), tail),
+			close: body.Close,
+		}
+		return malwareScanOutcome{Body: newBody, Size: int64(len(buf)), ErrMsg: "malware_skipped_oversize"}
+	}
+	// Fully buffered — close original.
+	_ = body.Close()
+
+	if len(buf) == 0 {
+		return malwareScanOutcome{Body: http.NoBody, Size: 0}
+	}
+
+	scanner := s.Malware
+	if scanner == nil {
+		scanner = malware.Nop{}
+	}
+	res, scanErr := scanner.Scan(ctx, bytes.NewReader(buf), maxBytes)
+	if scanErr == nil && res.Error != nil {
+		scanErr = res.Error
+	}
+
+	replacement := io.NopCloser(bytes.NewReader(buf))
+	out := malwareScanOutcome{Body: replacement, Size: int64(len(buf))}
+
+	if scanErr != nil {
+		out.ErrMsg = "malware_scan: " + scanErr.Error()
+		if s != nil && s.MalwareFailClosed {
+			out.BlockReason = "Malware scan unavailable"
+			slog.Error("malware scan failed (fail-closed)", "err", scanErr)
+		} else {
+			slog.Error("malware scan failed (fail-open)", "err", scanErr)
+		}
+		return out
+	}
+	if res.Infected {
+		sig := res.Signature
+		if sig == "" {
+			sig = "unknown"
+		}
+		out.BlockReason = fmt.Sprintf("Malware detected: %s", sig)
+		out.ErrMsg = "malware_detected"
+		return out
+	}
+	return out
+}
+
+func (s *Server) malwareMaxBytes() int64 {
+	if s != nil && s.MalwareMaxBytes > 0 {
+		return s.MalwareMaxBytes
+	}
+	return malware.DefaultMaxScanBytes
+}
+
+// multiReadCloser chains a reader with a closer (original body).
+type multiReadCloser struct {
+	r     io.Reader
+	close func() error
+}
+
+func (m *multiReadCloser) Read(p []byte) (int, error) { return m.r.Read(p) }
+func (m *multiReadCloser) Close() error {
+	if m.close != nil {
+		return m.close()
+	}
+	return nil
 }

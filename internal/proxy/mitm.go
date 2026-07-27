@@ -399,6 +399,27 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		return
 	}
 
+	// Request-body malware scan when policy enables it.
+	reqSize := req.ContentLength
+	if d.MalwareScan && req.Body != nil && req.Body != http.NoBody {
+		out := s.scanHTTPBody(req.Context(), req.Body, req.ContentLength)
+		req.Body = out.Body
+		if out.ErrMsg != "malware_skipped_oversize" && out.Size >= 0 && req.Body != http.NoBody {
+			req.ContentLength = out.Size
+			req.Header.Set("Content-Length", fmt.Sprintf("%d", out.Size))
+			req.Header.Del("Transfer-Encoding")
+			reqSize = out.Size
+		}
+		if out.BlockReason != "" {
+			d.FinalAction = policy.ActionBlock
+			d.BlockReason = out.BlockReason
+			pr.Decision = d
+			n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), d.BlockPageID), target, d.BlockReason, username, clientIPStr)
+			s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), out.ErrMsg)
+			return
+		}
+	}
+
 	applyRequestHeaderMods(req, d.HeaderMods)
 	stripHopByHop(req.Header)
 	req.Header.Del("Proxy-Authorization")
@@ -425,7 +446,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		}
 		r.Header.Set("Content-Type", "text/plain; charset=utf-8")
 		_ = r.Write(clientWriter)
-		s.recordOutcome(req.Context(), pr, req, target, "error", req.ContentLength, int64(len(errBody)), err.Error())
+		s.recordOutcome(req.Context(), pr, req, target, "error", reqSize, int64(len(errBody)), err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -445,15 +466,26 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		}
 		br.Header.Set("Content-Type", "text/html; charset=utf-8")
 		_ = br.Write(clientWriter)
-		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(len(body)), "")
+		s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(len(body)), "")
 		return
 	}
 
-	// Malware scan stub: only invoked when policy enables; no-op returns clean.
-	// Real body scanning is wired in a later task (avoids buffering here).
+	// Response-body malware scan when policy enables it.
 	if d.MalwareScan {
-		if _, err := s.Malware.Scan(req.Context(), strings.NewReader(""), 0); err != nil {
-			slog.Debug("malware scan stub", "err", err)
+		out := s.scanHTTPBody(req.Context(), resp.Body, resp.ContentLength)
+		resp.Body = out.Body
+		if out.Size > 0 && out.ErrMsg != "malware_skipped_oversize" {
+			resp.ContentLength = out.Size
+			resp.Header.Set("Content-Length", fmt.Sprintf("%d", out.Size))
+			resp.Header.Del("Transfer-Encoding")
+		}
+		if out.BlockReason != "" {
+			d.FinalAction = policy.ActionBlock
+			d.BlockReason = out.BlockReason
+			pr.Decision = d
+			n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), d.BlockPageID), target, d.BlockReason, username, clientIPStr)
+			s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), out.ErrMsg)
+			return
 		}
 	}
 
@@ -463,10 +495,30 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 	// Measure response size while streaming to client.
 	cw := &countingWriter{w: clientWriter}
 	if err := resp.Write(cw); err != nil {
-		s.recordOutcome(req.Context(), pr, req, target, "error", req.ContentLength, cw.n, err.Error())
+		s.recordOutcome(req.Context(), pr, req, target, "error", reqSize, cw.n, err.Error())
 		return
 	}
-	s.recordOutcome(req.Context(), pr, req, target, "allow", req.ContentLength, cw.n, "")
+	s.recordOutcome(req.Context(), pr, req, target, "allow", reqSize, cw.n, "")
+}
+
+// writeMITMBlock writes an HTML block page as an HTTP/1.1 response on the MITM TLS connection.
+func writeMITMBlock(w io.Writer, htmlTpl string, target *url.URL, reason, username, clientIP string) int {
+	urlStr := ""
+	if target != nil {
+		urlStr = target.String()
+	}
+	body := blockpage.Render(htmlTpl, blockpage.Context{
+		URL: urlStr, Reason: reason, Username: username, ClientIP: clientIP, Timestamp: time.Now().UTC(),
+	})
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden, ProtoMajor: 1, ProtoMinor: 1,
+		Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))),
+		ContentLength: int64(len(body)), Close: true,
+	}
+	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+	resp.Header.Set("Cache-Control", "no-store")
+	_ = resp.Write(w)
+	return len(body)
 }
 
 // bufConn presents a net.Conn that reads from r first (buffered CONNECT leftovers).
