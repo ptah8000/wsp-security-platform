@@ -3,6 +3,8 @@ package store
 import (
 	"testing"
 	"testing/fstest"
+
+	"github.com/wsp-security/wsp/migrations"
 )
 
 func TestListUpMigrations(t *testing.T) {
@@ -36,5 +38,18 @@ func TestListUpMigrationsEmpty(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("len = %d, want 0", len(got))
+	}
+}
+
+func TestListUpMigrationsEmbeddedFS(t *testing.T) {
+	got, err := listUpMigrations(migrations.FS)
+	if err != nil {
+		t.Fatalf("listUpMigrations(migrations.FS): %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("expected at least one up migration in migrations.FS")
+	}
+	if got[0].version != "001" || got[0].name != "init" {
+		t.Errorf("first embedded migration = %+v, want version=001 name=init", got[0])
 	}
 }

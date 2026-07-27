@@ -54,12 +54,21 @@ func TestIntegration_MigratePingAndSettings(t *testing.T) {
 		t.Fatalf("Ping: %v", err)
 	}
 
+	// Re-seed expected defaults so assertions hold on a reused/dirty DB
+	// (migrations only insert seed rows once; later tests or manual use may change them).
+	if err := s.SetSetting(ctx, store.SettingSetupCompleted, json.RawMessage(`false`)); err != nil {
+		t.Fatalf("reset setup_completed: %v", err)
+	}
+	if err := s.SetSetting(ctx, store.SettingLogRetentionDays, json.RawMessage(`30`)); err != nil {
+		t.Fatalf("reset log_retention_days: %v", err)
+	}
+
 	complete, err := s.IsSetupComplete(ctx)
 	if err != nil {
 		t.Fatalf("IsSetupComplete: %v", err)
 	}
 	if complete {
-		t.Fatalf("IsSetupComplete = true, want false after fresh seed")
+		t.Fatalf("IsSetupComplete = true, want false after seed defaults")
 	}
 
 	raw, err := s.GetSetting(ctx, store.SettingLogRetentionDays)
@@ -80,12 +89,12 @@ func TestIntegration_CreateAndGetUser(t *testing.T) {
 	ctx := context.Background()
 
 	username := "itest_" + uuid.NewString()[:8]
+	// Enabled is intentionally omitted (false zero-value); CreateUser must still enable.
 	created, err := s.CreateUser(ctx, store.User{
 		Username:     username,
 		PasswordHash: "argon2id$test-hash-not-real",
 		DisplayName:  "Integration Tester",
 		Role:         store.RoleAdmin,
-		Enabled:      true,
 	})
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)

@@ -31,7 +31,8 @@ type User struct {
 
 // CreateUser inserts a new user and returns the row as stored (including generated id/timestamps).
 // Callers must set Username and PasswordHash; Role defaults to "user" when empty.
-// Enabled is stored as provided (set true for normal accounts).
+// New accounts are always created enabled (u.Enabled is ignored). Use a dedicated
+// SetUserEnabled later if disable-on-create is needed.
 func (s *Store) CreateUser(ctx context.Context, u User) (User, error) {
 	if u.Username == "" {
 		return User{}, fmt.Errorf("username is required")
@@ -46,6 +47,9 @@ func (s *Store) CreateUser(ctx context.Context, u User) (User, error) {
 		return User{}, fmt.Errorf("invalid role %q", u.Role)
 	}
 
+	// v1: always create active users (avoids bool zero-value footgun).
+	const enabled = true
+
 	const q = `
 INSERT INTO users (username, password_hash, display_name, role, enabled)
 VALUES ($1, $2, $3, $4, $5)
@@ -57,7 +61,7 @@ RETURNING id, username, password_hash, display_name, role, enabled, created_at, 
 		u.PasswordHash,
 		u.DisplayName,
 		u.Role,
-		u.Enabled,
+		enabled,
 	).Scan(
 		&out.ID,
 		&out.Username,
