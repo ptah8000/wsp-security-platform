@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/wsp-security/wsp/internal/config"
+	"github.com/wsp-security/wsp/internal/store"
 	_ "github.com/wsp-security/wsp/web" // embed admin UI assets (placeholder in v1 scaffold)
 )
 
@@ -38,8 +41,7 @@ func main() {
 		"admin_addr", cfg.AdminAddr,
 	)
 
-	// migrate hook stub — store layer lands in a later task
-	if err := runMigrationsStub(cfg); err != nil {
+	if err := runMigrations(cfg); err != nil {
 		slog.Error("migrations failed", "err", err)
 		os.Exit(1)
 	}
@@ -64,8 +66,25 @@ func setupLogger(level string) {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lv})))
 }
 
-// runMigrationsStub is a placeholder until internal/store implements migrations.
-func runMigrationsStub(cfg config.Config) error {
-	slog.Info("migrate hook stub", "database_url_set", cfg.DatabaseURL != "")
+// runMigrations opens the store, applies pending SQL migrations, and closes the pool.
+// Later tasks will keep a long-lived Store for listeners.
+func runMigrations(cfg config.Config) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	s, err := store.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	defer s.Close()
+
+	if err := s.Migrate(ctx); err != nil {
+		return err
+	}
+	complete, err := s.IsSetupComplete(ctx)
+	if err != nil {
+		return fmt.Errorf("setup status: %w", err)
+	}
+	slog.Info("migrations applied", "setup_complete", complete)
 	return nil
 }
