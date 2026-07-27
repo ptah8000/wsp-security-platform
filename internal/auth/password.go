@@ -19,13 +19,20 @@ const (
 	argonThreads = 2
 	argonKeyLen  = 32
 	argonSaltLen = 16
+
+	// MaxPasswordBytes is the maximum accepted password length (UTF-8 bytes).
+	// Caps DoS from extremely large inputs into argon2.
+	MaxPasswordBytes = 1024
 )
 
 // HashPassword returns a PHC-formatted argon2id hash of password.
-// Empty passwords are rejected.
+// Empty passwords and passwords longer than MaxPasswordBytes are rejected.
 func HashPassword(password string) (string, error) {
 	if password == "" {
 		return "", errors.New("password must not be empty")
+	}
+	if len(password) > MaxPasswordBytes {
+		return "", errors.New("password exceeds maximum length")
 	}
 
 	salt := make([]byte, argonSaltLen)
@@ -47,8 +54,12 @@ func HashPassword(password string) (string, error) {
 
 // CheckPassword reports whether password matches a PHC argon2id hash.
 // Invalid or unsupported hashes return false (never panics).
+// Empty passwords and passwords longer than MaxPasswordBytes return false.
 func CheckPassword(hash, password string) bool {
 	if hash == "" || password == "" {
+		return false
+	}
+	if len(password) > MaxPasswordBytes {
 		return false
 	}
 

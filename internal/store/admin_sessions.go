@@ -68,13 +68,15 @@ RETURNING id, user_id, token_hash, expires_at, ip, user_agent, created_at
 }
 
 // GetUserByAdminTokenHash returns the user for a non-expired admin session token hash.
+// PasswordHash is not selected (session-safe); it is always empty on success.
 // Expired sessions yield pgx.ErrNoRows (wrapped).
 func (s *Store) GetUserByAdminTokenHash(ctx context.Context, tokenHash string) (User, error) {
 	if tokenHash == "" {
 		return User{}, fmt.Errorf("token_hash is required")
 	}
+	// Omit password_hash: session auth must not load credential material.
 	const q = `
-SELECT u.id, u.username, u.password_hash, u.display_name, u.role, u.enabled,
+SELECT u.id, u.username, u.display_name, u.role, u.enabled,
        u.created_at, u.updated_at, u.last_login_at
 FROM admin_sessions s
 JOIN users u ON u.id = s.user_id
@@ -85,7 +87,6 @@ WHERE s.token_hash = $1
 	err := s.pool.QueryRow(ctx, q, tokenHash).Scan(
 		&out.ID,
 		&out.Username,
-		&out.PasswordHash,
 		&out.DisplayName,
 		&out.Role,
 		&out.Enabled,
@@ -99,6 +100,7 @@ WHERE s.token_hash = $1
 		}
 		return User{}, fmt.Errorf("get user by admin token hash: %w", err)
 	}
+	out.PasswordHash = ""
 	return out, nil
 }
 

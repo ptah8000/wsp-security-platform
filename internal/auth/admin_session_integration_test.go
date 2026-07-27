@@ -77,6 +77,9 @@ func TestIntegration_AdminSessionLifecycle(t *testing.T) {
 	if got.ID != user.ID || got.Username != user.Username {
 		t.Fatalf("user = %+v, want id=%s username=%s", got, user.ID, user.Username)
 	}
+	if got.PasswordHash != "" {
+		t.Error("UserFromToken must not load password_hash")
+	}
 
 	_, err = sm.UserFromToken(ctx, token+"x")
 	if err == nil {

@@ -27,13 +27,21 @@ func NewProxyAuthCache(s *store.Store, ttl time.Duration) *ProxyAuthCache {
 	return &ProxyAuthCache{store: s, ttl: ttl}
 }
 
-// Get returns a cached username/userID for ip when a non-expired entry exists.
+// Get returns a cached username/userID for ip when a non-expired entry exists
+// and the mapped user is still enabled. Disabled users are treated as a cache miss.
 func (c *ProxyAuthCache) Get(ctx context.Context, ip string) (username string, userID uuid.UUID, ok bool) {
 	if c == nil || c.store == nil || ip == "" {
 		return "", uuid.Nil, false
 	}
 	entry, found, err := c.store.GetProxyAuthCache(ctx, ip)
 	if err != nil || !found {
+		return "", uuid.Nil, false
+	}
+	if entry.UserID == uuid.Nil {
+		return "", uuid.Nil, false
+	}
+	user, err := c.store.GetUserByID(ctx, entry.UserID)
+	if err != nil || !user.Enabled {
 		return "", uuid.Nil, false
 	}
 	return entry.Username, entry.UserID, true

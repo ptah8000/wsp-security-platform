@@ -54,6 +54,30 @@ func TestHashPasswordEmpty(t *testing.T) {
 	}
 }
 
+func TestHashPasswordTooLong(t *testing.T) {
+	long := strings.Repeat("a", MaxPasswordBytes+1)
+	_, err := HashPassword(long)
+	if err == nil {
+		t.Fatal("HashPassword(>1024 bytes) = nil error, want error")
+	}
+	// Boundary: exactly MaxPasswordBytes is accepted.
+	ok := strings.Repeat("b", MaxPasswordBytes)
+	if _, err := HashPassword(ok); err != nil {
+		t.Fatalf("HashPassword(1024 bytes): %v", err)
+	}
+}
+
+func TestCheckPasswordTooLong(t *testing.T) {
+	hash, err := HashPassword("short-enough")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	long := strings.Repeat("a", MaxPasswordBytes+1)
+	if CheckPassword(hash, long) {
+		t.Error("CheckPassword with >1024 byte password = true, want false")
+	}
+}
+
 func TestCheckPasswordInvalidHash(t *testing.T) {
 	if CheckPassword("", "password") {
 		t.Error("empty hash should not verify")

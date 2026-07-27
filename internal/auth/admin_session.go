@@ -75,6 +75,8 @@ func (m *SessionManager) UserFromToken(ctx context.Context, token string) (*stor
 		}
 		return nil, err
 	}
+	// Session resolution must never expose password material.
+	user.PasswordHash = ""
 	if !user.Enabled {
 		return nil, errors.New("user is disabled")
 	}
