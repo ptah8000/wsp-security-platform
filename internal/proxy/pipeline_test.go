@@ -328,6 +328,85 @@ func (forceIsolateRBI) HandleIsolation(http.ResponseWriter, *http.Request, polic
 	return false
 }
 
+// successRBI starts a fake isolation viewer (HandleIsolation true).
+type successRBI struct {
+	calls int
+}
+
+func (s *successRBI) ShouldIsolate(d policy.Decision) bool { return d.RBIIsolated }
+func (s *successRBI) HandleIsolation(w http.ResponseWriter, req *http.Request, d policy.Decision) bool {
+	s.calls++
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("<html>RBI viewer mock</html>"))
+	return true
+}
+
+func TestRBIHandleIsolation_SuccessDoesNotForward(t *testing.T) {
+	originHit := false
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originHit = true
+		_, _ = w.Write([]byte("origin-should-not-see"))
+	}))
+	t.Cleanup(origin.Close)
+
+	rules := []policy.Rule{{
+		ID:       uuid.MustParse("00000000-0000-4000-8000-0000000000a2"),
+		Name:     "rbi-ok",
+		Enabled:  true,
+		Priority: 1,
+		Sections: policy.RuleSections{
+			General: policy.GeneralSection{Action: policy.ActionAllow, AuthMode: policy.AuthDisable},
+			RBI:     policy.RBISection{Mode: policy.RBIIsolated},
+		},
+	}}
+	snap, err := policy.Compile(rules, nil)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	var eng policy.Engine
+	eng.Swap(snap)
+
+	rbiHook := &successRBI{}
+	rec := logging.NewRecorder(nil)
+	srv := &Server{
+		Engine:   &eng,
+		Recorder: rec,
+		RBI:      rbiHook,
+	}
+
+	target, err := url.Parse(origin.URL + "/secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, target.String(), nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.RequestURI = target.String()
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	if originHit {
+		t.Fatal("origin must not be contacted when RBI isolation handles the request")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "RBI viewer") {
+		t.Fatalf("body=%q", rr.Body.String())
+	}
+	if rbiHook.calls != 1 {
+		t.Fatalf("HandleIsolation calls=%d", rbiHook.calls)
+	}
+	last, ok := rec.Last()
+	if !ok || last.Decision != "allow" {
+		t.Fatalf("log decision=%v ok=%v", last.Decision, ok)
+	}
+	if last.Error != "rbi" {
+		t.Fatalf("error field=%q want rbi", last.Error)
+	}
+}
+
 func TestRBIFailClosed_HTTPDoesNotForward(t *testing.T) {
 	originHit := false
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,6 +146,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// RBI viewer / WebSocket control paths (origin-form or absolute-form).
+	if s.tryServeRBIPath(w, req) {
+		return
+	}
+
 	// Absolute-form URI required for forward proxy HTTP requests.
 	if req.URL == nil || !req.URL.IsAbs() {
 		// Some clients send origin-form with Host header — accept and absolutize.
@@ -164,6 +170,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	s.handleHTTP(w, req)
+}
+
+// tryServeRBIPath dispatches /rbi/* to the orchestrator when available.
+func (s *Server) tryServeRBIPath(w http.ResponseWriter, req *http.Request) bool {
+	if s == nil || req == nil || req.URL == nil {
+		return false
+	}
+	path := req.URL.Path
+	if path == "" || !strings.HasPrefix(path, "/rbi/") {
+		return false
+	}
+	handler, ok := s.RBI.(rbiPathServer)
+	if !ok || handler == nil {
+		http.Error(w, "RBI viewer unavailable", http.StatusServiceUnavailable)
+		return true
+	}
+	return handler.ServeRBIPath(w, req)
 }
 
 // handleHTTP processes plain HTTP absolute-form proxy requests.

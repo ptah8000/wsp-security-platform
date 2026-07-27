@@ -18,6 +18,7 @@ import (
 	"github.com/wsp-security/wsp/internal/logging"
 	"github.com/wsp-security/wsp/internal/malware"
 	"github.com/wsp-security/wsp/internal/proxy"
+	"github.com/wsp-security/wsp/internal/rbi"
 	"github.com/wsp-security/wsp/internal/store"
 	_ "github.com/wsp-security/wsp/web" // embed admin UI assets (placeholder in v1 scaffold)
 )
@@ -151,6 +152,8 @@ func run(ctx context.Context, cfg config.Config) error {
 	casbAdapter := casb.NewProxyAdapter()
 	slog.Info("CASB catalog loaded", "detectors", len(casbAdapter.Inner.Detectors()))
 
+	rbiOrch := initRBI(cfg)
+
 	srv := &proxy.Server{
 		Addr:              cfg.ProxyAddr,
 		Engine:            engine,
@@ -162,6 +165,7 @@ func run(ctx context.Context, cfg config.Config) error {
 		CASB:              casbAdapter,
 		Malware:           clam,
 		MalwareFailClosed: cfg.MalwareFailClosed,
+		RBI:               rbiOrch,
 	}
 
 	errc := make(chan error, 1)
@@ -169,12 +173,16 @@ func run(ctx context.Context, cfg config.Config) error {
 		errc <- srv.Start(ctx)
 	}()
 
-	slog.Info("gateway ready", "proxy_addr", cfg.ProxyAddr, "mode", cfg.Mode)
+	slog.Info("gateway ready", "proxy_addr", cfg.ProxyAddr, "mode", cfg.Mode,
+		"rbi_image", cfg.RBIImage, "max_rbi_sessions", cfg.MaxRBISessions)
 
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
+		if rbiOrch != nil {
+			rbiOrch.StopAll(shutdownCtx)
+		}
 		_ = srv.Shutdown(shutdownCtx)
 		if err := <-errc; err != nil {
 			return err
@@ -184,4 +192,33 @@ func run(ctx context.Context, cfg config.Config) error {
 	case err := <-errc:
 		return err
 	}
+}
+
+// initRBI builds the RBI orchestrator. When Docker is unreachable at startup,
+// the orchestrator is still installed so policy isolation fails closed per request
+// (HandleIsolation returns false → block page) rather than silently disabling RBI.
+func initRBI(cfg config.Config) *rbi.Orchestrator {
+	rt, err := rbi.NewDockerRuntime(cfg.DockerHost)
+	if err != nil {
+		slog.Warn("RBI docker client init failed; isolation will fail-closed until fixed",
+			"err", err, "docker_host", cfg.DockerHost)
+		return rbi.NewOrchestrator(rbi.Config{
+			Runtime:     nil, // Start → ErrDockerUnavailable
+			Image:       cfg.RBIImage,
+			MaxSessions: cfg.MaxRBISessions,
+		})
+	}
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rt.Ping(pingCtx); err != nil {
+		slog.Warn("RBI docker ping failed; isolation will fail-closed until daemon is available",
+			"err", err, "docker_host", cfg.DockerHost)
+	} else {
+		slog.Info("RBI docker ready", "image", cfg.RBIImage, "max_sessions", cfg.MaxRBISessions)
+	}
+	return rbi.NewOrchestrator(rbi.Config{
+		Runtime:     rt,
+		Image:       cfg.RBIImage,
+		MaxSessions: cfg.MaxRBISessions,
+	})
 }

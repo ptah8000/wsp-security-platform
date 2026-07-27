@@ -34,13 +34,21 @@ type CASBInspector interface {
 	InspectResponse(ctx context.Context, req *http.Request, resp *http.Response, d policy.Decision) (blockReason string, err error)
 }
 
-// RBIOrchestrator hands off isolated browsing (stub no-op in v1 skeleton).
+// RBIOrchestrator hands off isolated browsing.
 type RBIOrchestrator interface {
 	// ShouldIsolate reports whether this request should use RBI.
 	ShouldIsolate(d policy.Decision) bool
 	// HandleIsolation serves the isolation viewer instead of origin bytes.
-	// Returns true if the request was fully handled.
+	// Returns true if the request was fully handled (viewer HTML written).
+	// Returns false when isolation cannot start (Docker down, max sessions, …)
+	// so the proxy fails closed with a block page.
 	HandleIsolation(w http.ResponseWriter, req *http.Request, d policy.Decision) bool
+}
+
+// rbiPathServer is an optional extension for /rbi/* viewer and WebSocket routes.
+// Implemented by *rbi.Orchestrator; stubs omit it.
+type rbiPathServer interface {
+	ServeRBIPath(w http.ResponseWriter, req *http.Request) bool
 }
 
 // noopCASB is a silent no-op used only when explicitly desired in tests.

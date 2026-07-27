@@ -229,7 +229,22 @@ func (s *Server) serveMITM(clientConn net.Conn, clientBuf *bufio.ReadWriter, con
 		// Preserve client identity from CONNECT.
 		req.RemoteAddr = connectReq.RemoteAddr
 
-		s.handleMITMRequest(tlsConn, req, pr, originAuthority)
+		// RBI viewer/WS under the isolated origin (same TLS session).
+		if req.URL != nil && strings.HasPrefix(req.URL.Path, "/rbi/") {
+			rw := &mitmResponseWriter{w: tlsConn, conn: tlsConn, br: br, header: make(http.Header)}
+			if s.tryServeRBIPath(rw, req) {
+				if rw.hijacked {
+					// WebSocket took the connection; end MITM loop.
+					return
+				}
+				continue
+			}
+		}
+
+		if s.handleMITMRequest(tlsConn, br, req, pr, originAuthority) {
+			// Connection hijacked (e.g. RBI WS via HandleIsolation edge cases).
+			return
+		}
 	}
 }
 
@@ -290,7 +305,8 @@ func (s *Server) serveBlockedOnTLS(conn net.Conn, connectReq *http.Request, pr *
 }
 
 // handleMITMRequest evaluates policy again for the full URL and forwards to origin.
-func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, connectPR *pipelineResult, dialAddr string) {
+// Returns true when the underlying connection was hijacked (caller must stop the MITM loop).
+func (s *Server) handleMITMRequest(clientWriter io.Writer, br *bufio.Reader, req *http.Request, connectPR *pipelineResult, dialAddr string) (hijacked bool) {
 	start := time.Now().UTC()
 	s.ensureHooks()
 
@@ -344,16 +360,17 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		_ = resp.Write(clientWriter)
 		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(len(body)), "")
 		_ = req.Body.Close()
-		return
+		return false
 	}
 
 	// RBI fail-closed: never forward origin when isolation is required.
 	if needsIsolation(d, s.RBI) {
-		rw := &mitmResponseWriter{w: clientWriter, header: make(http.Header)}
+		conn, _ := clientWriter.(net.Conn)
+		rw := &mitmResponseWriter{w: clientWriter, conn: conn, br: br, header: make(http.Header)}
 		if s.RBI.HandleIsolation(rw, req, d) {
 			s.recordOutcome(req.Context(), pr, req, target, "allow", req.ContentLength, rw.n, "rbi")
 			_ = req.Body.Close()
-			return
+			return rw.hijacked
 		}
 		d.FinalAction = policy.ActionBlock
 		if d.BlockReason == "" {
@@ -374,7 +391,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		_ = resp.Write(clientWriter)
 		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(len(body)), "rbi_unavailable")
 		_ = req.Body.Close()
-		return
+		return false
 	}
 
 	// CASB request-side enforcement (targeted block page on Hit).
@@ -387,7 +404,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), nil), target, reason, username, clientIPStr)
 		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(n), "casb")
 		_ = req.Body.Close()
-		return
+		return false
 	}
 
 	// Request-body malware scan when policy enables it.
@@ -407,7 +424,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 			pr.Decision = d
 			n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), d.BlockPageID), target, d.BlockReason, username, clientIPStr)
 			s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), out.ErrMsg)
-			return
+			return false
 		}
 	}
 
@@ -438,7 +455,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		r.Header.Set("Content-Type", "text/plain; charset=utf-8")
 		_ = r.Write(clientWriter)
 		s.recordOutcome(req.Context(), pr, req, target, "error", reqSize, int64(len(errBody)), err.Error())
-		return
+		return false
 	}
 	defer resp.Body.Close()
 
@@ -452,7 +469,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		pr.Decision = d
 		n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), nil), target, reason, username, clientIPStr)
 		s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), "casb")
-		return
+		return false
 	}
 
 	// Response-body malware scan when policy enables it.
@@ -470,7 +487,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 			pr.Decision = d
 			n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), d.BlockPageID), target, d.BlockReason, username, clientIPStr)
 			s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), out.ErrMsg)
-			return
+			return false
 		}
 	}
 
@@ -481,9 +498,10 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 	cw := &countingWriter{w: clientWriter}
 	if err := resp.Write(cw); err != nil {
 		s.recordOutcome(req.Context(), pr, req, target, "error", reqSize, cw.n, err.Error())
-		return
+		return false
 	}
 	s.recordOutcome(req.Context(), pr, req, target, "allow", reqSize, cw.n, "")
+	return false
 }
 
 // writeMITMBlock writes an HTML block page as an HTTP/1.1 response on the MITM TLS connection.
@@ -581,12 +599,16 @@ func parseCONNECTTarget(raw string) (host, port, dialAddr string, err error) {
 
 // mitmResponseWriter adapts an MITM TLS/conn writer to http.ResponseWriter
 // so RBIOrchestrator.HandleIsolation can serve viewer HTML on the MITM path.
+// It also implements http.Hijacker for RBI WebSocket upgrades.
 type mitmResponseWriter struct {
 	w           io.Writer
+	conn        net.Conn
+	br          *bufio.Reader
 	header      http.Header
 	status      int
 	wroteHeader bool
 	wrote       bool
+	hijacked    bool
 	n           int64
 }
 
@@ -598,7 +620,7 @@ func (m *mitmResponseWriter) Header() http.Header {
 }
 
 func (m *mitmResponseWriter) WriteHeader(statusCode int) {
-	if m.wroteHeader {
+	if m.wroteHeader || m.hijacked {
 		return
 	}
 	m.status = statusCode
@@ -624,6 +646,9 @@ func (m *mitmResponseWriter) WriteHeader(statusCode int) {
 }
 
 func (m *mitmResponseWriter) Write(p []byte) (int, error) {
+	if m.hijacked {
+		return 0, http.ErrHijacked
+	}
 	if !m.wroteHeader {
 		m.WriteHeader(http.StatusOK)
 	}
@@ -631,6 +656,29 @@ func (m *mitmResponseWriter) Write(p []byte) (int, error) {
 	m.n += int64(n)
 	m.wrote = true
 	return n, err
+}
+
+// Hijack implements http.Hijacker for WebSocket upgrades on the MITM TLS conn.
+func (m *mitmResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if m.hijacked {
+		return nil, nil, fmt.Errorf("connection already hijacked")
+	}
+	if m.wroteHeader {
+		return nil, nil, fmt.Errorf("http: connection has been written to")
+	}
+	if m.conn == nil {
+		return nil, nil, fmt.Errorf("hijack not supported")
+	}
+	m.hijacked = true
+	m.wroteHeader = true
+	m.wrote = true
+	br := m.br
+	if br == nil {
+		br = bufio.NewReader(m.conn)
+	}
+	bc := &bufConn{Conn: m.conn, r: br}
+	bw := bufio.NewWriter(m.conn)
+	return bc, bufio.NewReadWriter(br, bw), nil
 }
 
 func (s *Server) idleTimeout() time.Duration {
