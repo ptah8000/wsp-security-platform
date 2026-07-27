@@ -536,6 +536,39 @@ func TestDisabledRulesSkipped(t *testing.T) {
 	}
 }
 
+func TestRBIIsolatedImpliesTLSIntercept(t *testing.T) {
+	// RBI isolation without explicit TLSIntercept must still force intercept
+	// so CONNECT cannot tunnel opaque origin bytes past isolation.
+	rules := []Rule{{
+		ID:       ruleID(1),
+		Name:     "rbi-only",
+		Enabled:  true,
+		Priority: 10,
+		Sections: RuleSections{
+			General: GeneralSection{
+				Action:       ActionAllow,
+				TLSIntercept: false,
+				AuthMode:     AuthDisable,
+			},
+			RBI: RBISection{Mode: RBIIsolated},
+		},
+	}}
+	snap, err := Compile(rules, nil)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	var eng Engine
+	eng.Swap(snap)
+
+	d := eng.Evaluate(baseInput(t))
+	if !d.RBIIsolated {
+		t.Fatal("expected RBIIsolated")
+	}
+	if !d.TLSIntercept {
+		t.Fatal("RBIIsolated must imply TLSIntercept=true in accumulate")
+	}
+}
+
 func TestCompileOrdersByPriority(t *testing.T) {
 	// Higher priority number defined first in slice; lower priority must evaluate first.
 	rules := []Rule{

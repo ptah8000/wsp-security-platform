@@ -83,6 +83,25 @@ func (s *Server) handleCONNECT(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Isolation requires decrypt so RBI can run; never tunnel opaque origin bytes.
+	// Force TLS intercept when RBI isolation is mandated (even if TLSIntercept was false).
+	isolate := needsIsolation(d, s.RBI)
+	if isolate && !d.TLSIntercept {
+		d.TLSIntercept = true
+		pr.Decision = d
+	}
+
+	// Fail-closed before hijack when isolation needs MITM but no CA is available.
+	// (serveMITM would also refuse, but avoid establishing a raw tunnel path.)
+	if isolate && s.Certs == nil {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		body := blockpage.ShortBody(rbiUnavailableReason)
+		_, _ = w.Write(body)
+		s.recordOutcome(req.Context(), pr, req, targetURL, "block", 0, int64(len(body)), "rbi_requires_mitm_no_ca")
+		return
+	}
+
 	// Hijack client connection for tunnel or MITM.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -98,13 +117,13 @@ func (s *Server) handleCONNECT(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// MITM path (also used for block-with-intercept so we can serve a block page).
-	if d.TLSIntercept {
+	// MITM path (also used for block-with-intercept / isolation so we can decrypt + RBI).
+	if d.TLSIntercept || isolate {
 		s.serveMITM(clientConn, clientBuf, req, pr, hostOnly, targetHost)
 		return
 	}
 
-	// Transparent tunnel (no interception).
+	// Transparent tunnel (no interception) — only when isolation is not required.
 	s.serveTunnel(clientConn, clientBuf, req, pr, targetHost, targetURL)
 }
 

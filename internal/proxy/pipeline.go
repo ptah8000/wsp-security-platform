@@ -104,6 +104,9 @@ func buildInput(req *http.Request, clientIP net.IP, username string, target *url
 
 // evaluate runs policy.Engine (nil-safe → default allow).
 func (s *Server) evaluate(in policy.RequestInput) policy.Decision {
+	if s != nil && s.evaluateHook != nil {
+		return s.evaluateHook(in)
+	}
 	if s == nil || s.Engine == nil {
 		return policy.Decision{FinalAction: policy.ActionAllow, AuthMode: policy.AuthDisable}
 	}

@@ -24,6 +24,12 @@ import (
 	"github.com/wsp-security/wsp/internal/store"
 )
 
+// ContextDialer dials network connections; *net.Dialer implements it.
+// Tests may inject a mock that fails if the origin is contacted.
+type ContextDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
 // Server is the explicit forward proxy with optional TLS interception.
 type Server struct {
 	Addr     string
@@ -48,8 +54,12 @@ type Server struct {
 	MalwareMaxBytes int64
 
 	// Dialer / Transport for origin connections (tests may inject).
-	Dialer    *net.Dialer
+	// Dialer may be any type implementing DialContext (e.g. *net.Dialer or a test mock).
+	Dialer    ContextDialer
 	Transport *http.Transport
+
+	// evaluateHook, when set, overrides Engine.Evaluate (unit tests only).
+	evaluateHook func(policy.RequestInput) policy.Decision
 
 	// IdleTimeout for MITM keep-alive reads (default 2m).
 	IdleTimeout time.Duration

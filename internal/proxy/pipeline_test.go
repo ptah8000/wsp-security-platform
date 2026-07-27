@@ -1,18 +1,24 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/wsp-security/wsp/internal/certs"
 	"github.com/wsp-security/wsp/internal/logging"
 	"github.com/wsp-security/wsp/internal/malware"
 	"github.com/wsp-security/wsp/internal/policy"
@@ -467,4 +473,199 @@ func TestRBIFailClosed_HTTPDoesNotForward(t *testing.T) {
 	if last.Error != "rbi_unavailable" {
 		t.Fatalf("error field=%q want rbi_unavailable", last.Error)
 	}
+}
+
+// trackingDialer records dial attempts and fails so a tunnel path cannot succeed.
+type trackingDialer struct {
+	dials atomic.Int64
+}
+
+func (d *trackingDialer) DialContext(_ context.Context, network, address string) (net.Conn, error) {
+	d.dials.Add(1)
+	return nil, fmt.Errorf("mock dialer: origin must not be contacted (tried %s %s)", network, address)
+}
+
+// TestCONNECT_RBIIsolated_NoTLSIntercept_DoesNotDialOrigin ensures CONNECT never
+// opens a transparent tunnel when isolation is required, even if TLSIntercept is false.
+// A mock dialer fails if the origin is contacted.
+func TestCONNECT_RBIIsolated_NoTLSIntercept_DoesNotDialOrigin(t *testing.T) {
+	dialer := &trackingDialer{}
+	rec := logging.NewRecorder(nil)
+	srv := &Server{
+		Addr:     "127.0.0.1:0",
+		Recorder: rec,
+		Dialer:   dialer,
+		// No Certs: isolation + no CA must fail-closed (block), never tunnel.
+		RBI: noopRBI{},
+		evaluateHook: func(policy.RequestInput) policy.Decision {
+			return policy.Decision{
+				FinalAction:  policy.ActionAllow,
+				AuthMode:     policy.AuthDisable,
+				RBIIsolated:  true,
+				TLSIntercept: false, // critical: must not open origin tunnel
+			}
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Start(ctx) }()
+
+	var addr string
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		addr = srv.BoundAddr()
+		if addr != "" && !strings.HasSuffix(addr, ":0") {
+			c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+			if err == nil {
+				_ = c.Close()
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	addr = srv.BoundAddr()
+	if addr == "" || strings.HasSuffix(addr, ":0") {
+		t.Fatal("proxy did not bind")
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-errc:
+		case <-time.After(3 * time.Second):
+		}
+	})
+
+	// Raw CONNECT — if tunnel path ran, dialer would be hit for origin.
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	_, err = io.WriteString(conn, "CONNECT isolated.example:443 HTTP/1.1\r\nHost: isolated.example:443\r\n\r\n")
+	if err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if dialer.dials.Load() != 0 {
+		t.Fatalf("origin dial count=%d want 0 (tunnel must not open when RBIIsolated)", dialer.dials.Load())
+	}
+	// Fail-closed: no CA + isolation → 403 block (not 200 tunnel).
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("CONNECT must not return 200 tunnel when RBIIsolated and no MITM; body=%q", body)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d want 403 fail-closed; body=%q", resp.StatusCode, body)
+	}
+	last, ok := rec.Last()
+	if !ok || last.Decision != "block" {
+		t.Fatalf("log decision=%v ok=%v", last.Decision, ok)
+	}
+}
+
+// TestCONNECT_RBIIsolated_WithCA_ForcesMITMNotTunnel verifies isolation with a
+// CA forces MITM (200 Connection Established) without dialing origin for a tunnel.
+func TestCONNECT_RBIIsolated_WithCA_ForcesMITMNotTunnel(t *testing.T) {
+	ca, err := newTestCA(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := &trackingDialer{}
+	rec := logging.NewRecorder(nil)
+	srv := &Server{
+		Addr:     "127.0.0.1:0",
+		Recorder: rec,
+		Dialer:   dialer,
+		Certs:    ca,
+		RBI:      noopRBI{},
+		evaluateHook: func(policy.RequestInput) policy.Decision {
+			return policy.Decision{
+				FinalAction:  policy.ActionAllow,
+				AuthMode:     policy.AuthDisable,
+				RBIIsolated:  true,
+				TLSIntercept: false,
+			}
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Start(ctx) }()
+
+	var addr string
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		addr = srv.BoundAddr()
+		if addr != "" && !strings.HasSuffix(addr, ":0") {
+			c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+			if err == nil {
+				_ = c.Close()
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	addr = srv.BoundAddr()
+	if addr == "" || strings.HasSuffix(addr, ":0") {
+		t.Fatal("proxy did not bind")
+	}
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-errc:
+		case <-time.After(3 * time.Second):
+		}
+	})
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	_, err = io.WriteString(conn, "CONNECT isolated.example:443 HTTP/1.1\r\nHost: isolated.example:443\r\n\r\n")
+	if err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	// Body may be empty on 200; close when present.
+	if resp.Body != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	if dialer.dials.Load() != 0 {
+		t.Fatalf("origin dial count=%d want 0 (must force MITM, not tunnel)", dialer.dials.Load())
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want 200 Connection Established (MITM path)", resp.StatusCode)
+	}
+}
+
+func newTestCA(t *testing.T) (*certs.Provider, error) {
+	t.Helper()
+	p, err := certs.NewProvider(nil, "test-data-key-16b")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.GenerateSelfSignedCA(context.Background(), "WSP CONNECT RBI Test CA"); err != nil {
+		return nil, err
+	}
+	return p, nil
 }

@@ -29,3 +29,20 @@ Worktree: D:\Grok\WSP\.worktrees\wsp-v1
 ## Status
 
 Foundation complete for v1 code delivery; full Compose E2E deferred to Linux Docker environment.
+
+## Critical fix: CONNECT + RBI isolation (2026-07-27)
+
+**Finding:** `handleCONNECT` served a transparent tunnel when `TLSIntercept=false` even if `RBIIsolated` was true, delivering origin bytes and bypassing isolation.
+
+**Fix:**
+1. CONNECT path: if `needsIsolation` / `RBIIsolated`, never `serveTunnel`. Force MITM (`serveMITM`); if CA unavailable, fail-closed 403 block.
+2. Policy accumulate: when `RBIIsolated`, set `TLSIntercept=true` automatically.
+3. Unit tests:
+   - `TestRBIIsolatedImpliesTLSIntercept` (policy)
+   - `TestCONNECT_RBIIsolated_NoTLSIntercept_DoesNotDialOrigin` (mock dialer; origin never contacted)
+   - `TestCONNECT_RBIIsolated_WithCA_ForcesMITMNotTunnel` (MITM 200, dial count 0)
+
+**Verification:**
+- `go test ./internal/proxy/... ./internal/policy/... -count=1` → PASS
+- `go test ./... -count=1` → PASS
+- Commit: `fix: force MITM or fail-closed when RBI isolates CONNECT`

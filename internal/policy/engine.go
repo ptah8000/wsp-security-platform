@@ -72,6 +72,8 @@ func evaluateRules(rules []compiledRule, in RequestInput) Decision {
 // accumulateAllowActions merges additive actions from a matched rule.
 // TLSIntercept / RBI / malware use OR semantics; AuthMode last non-disable wins
 // when later rules set a stronger mode; CASB and header mods append.
+// RBIIsolated implies TLSIntercept so CONNECT cannot tunnel opaque origin bytes
+// past isolation (decrypt is required for RBI after MITM).
 func accumulateAllowActions(d *Decision, r *compiledRule) {
 	if r.tlsIntercept {
 		d.TLSIntercept = true
@@ -83,6 +85,8 @@ func accumulateAllowActions(d *Decision, r *compiledRule) {
 	}
 	if r.rbiIsolated {
 		d.RBIIsolated = true
+		// Isolation requires decrypt: force TLS intercept when RBI isolates.
+		d.TLSIntercept = true
 	}
 	if r.rbiBlockCopyFrom {
 		d.RBIBlockCopyFrom = true
