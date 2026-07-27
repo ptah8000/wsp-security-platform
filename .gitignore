@@ -1,3 +1,9 @@
-
-.worktrees/
-.superpowers/
+bin/
+dist/
+web/dist/
+web/node_modules/
+.env
+*.pem
+*.key
+.idea/
+.vscode/

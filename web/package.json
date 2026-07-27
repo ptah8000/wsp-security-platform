@@ -1,0 +1,10 @@
+{
+  "name": "wsp-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WSP admin SPA placeholder — full React+Vite app lands in a later task",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "dev": "echo \"SPA not implemented yet; open index.html as placeholder\""
+  }
+}

@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wsp
+      POSTGRES_PASSWORD: wsp
+      POSTGRES_DB: wsp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wsp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  clamav:
+    image: clamav/clamav:stable
+    # clamd listens on 3310 inside the compose network (no host publish required)
+    restart: unless-stopped
+
+  wsp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file: .env
+    environment:
+      WSP_DATABASE_URL: postgres://wsp:wsp@postgres:5432/wsp?sslmode=disable
+      WSP_CLAMD_ADDR: clamav:3310
+      DOCKER_HOST: unix:///var/run/docker.sock
+    ports:
+      - "8080:8080"
+      - "3000:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - wsp_data:/var/lib/wsp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clamav:
+        condition: service_started
+    # clamav may take a long time to load signatures — wsp must retry clamd
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  wsp_data:
