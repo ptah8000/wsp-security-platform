@@ -1,3 +1,12 @@
+bin/
+dist/
+web/node_modules/
+.env
+*.pem
+*.key
+.idea/
+.vscode/
 
-.worktrees/
-.superpowers/
+wsp.exe
+bin/
+

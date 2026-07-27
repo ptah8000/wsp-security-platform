@@ -1,0 +1,84 @@
+# Web Security Platform v1 — single-host Compose stack
+#
+# Quick start:
+#   cp env.example .env
+#   # set WSP_DATA_KEY=$(openssl rand -base64 32)
+#   docker compose up -d --build
+#   ./smoke.sh   (or open http://127.0.0.1:3000)
+#
+# Host ports (Windows often blocks 8080 via Hyper-V):
+#   Admin UI  → http://127.0.0.1:3000
+#   Proxy     → http://127.0.0.1:18080  (container :8080)
+
+name: wsp
+
+networks:
+  default:
+    name: wsp_net
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wsp
+      POSTGRES_PASSWORD: wsp
+      POSTGRES_DB: wsp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wsp -d wsp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks: [default]
+
+  clamav:
+    image: clamav/clamav:stable
+    # clamd listens on 3310 on the Compose network only.
+    # First start downloads signatures (several minutes); malware defaults to fail-open.
+    restart: unless-stopped
+    networks: [default]
+
+  wsp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file: .env
+    environment:
+      WSP_DATABASE_URL: postgres://wsp:wsp@postgres:5432/wsp?sslmode=disable
+      WSP_CLAMD_ADDR: clamav:3310
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # RBI containers join this network so CDP is reachable via container IP.
+      WSP_RBI_NETWORK: wsp_net
+      # Client Setup / PAC (host-facing proxy port).
+      WSP_PUBLIC_PROXY_HOST: 127.0.0.1
+      WSP_PUBLIC_PROXY_PORT: "18080"
+    # Distroless runs as nonroot (uid 65532). Docker Desktop mounts the socket
+    # as root:root mode 660 — supplementary group 0 is required for RBI.
+    # On Linux: set DOCKER_GID to the docker group (getent group docker | cut -d: -f3)
+    # and group_add: ["${DOCKER_GID}"].
+    group_add:
+      - "${DOCKER_GID:-0}"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "18080:8080"
+      - "3000:3000"
+    volumes:
+      # Required for RBI. Socket access ≈ host root — see README security notes.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - wsp_data:/var/lib/wsp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clamav:
+        condition: service_started
+    restart: unless-stopped
+    networks: [default]
+
+volumes:
+  pgdata:
+  wsp_data:
