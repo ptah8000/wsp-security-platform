@@ -54,26 +54,36 @@ func evaluateRules(rules []compiledRule, in RequestInput) Decision {
 		}
 
 		d.MatchedRuleIDs = append(d.MatchedRuleIDs, r.id)
+		// Record URL categories for this host (for logs / simulation UX).
+		if in.URL != nil {
+			for _, cat := range CategoriesForHost(hostname(in.URL)) {
+				d.URLCategories = appendUnique(d.URLCategories, cat)
+			}
+		}
 		accumulateAllowActions(&d, r)
 
 		if r.action == ActionBlock {
 			d.FinalAction = ActionBlock
 			d.BlockReason = r.blockReason
+			if d.BlockReason == "" {
+				d.BlockReason = "Blocked by web filter policy"
+			}
 			d.BlockPageID = cloneUUID(r.blockPageID)
 			// Stop on first matching Block (firewall-style).
 			return d
 		}
-		// Allow: keep FinalAction allow and continue.
+		// Allow: keep FinalAction allow and continue (malware/CASB may still accumulate).
 		d.FinalAction = ActionAllow
 	}
 	return d
 }
 
 // accumulateAllowActions merges additive actions from a matched rule.
-// TLSIntercept / RBI / malware use OR semantics; AuthMode last non-disable wins
-// when later rules set a stronger mode; CASB and header mods append.
-// RBIIsolated implies TLSIntercept so CONNECT cannot tunnel opaque origin bytes
-// past isolation (decrypt is required for RBI after MITM).
+// TLSIntercept / malware use OR; AuthMode last non-disable wins; CASB/header mods append.
+//
+// RBI uses first-explicit-wins: a rule with rbi.mode=isolated or not_isolated locks
+// the isolation decision so trusted allow rules (not_isolated) are not overridden by
+// a later “isolate uncategorized” rule — RBI sits behind URL filtering.
 func accumulateAllowActions(d *Decision, r *compiledRule) {
 	if r.tlsIntercept {
 		d.TLSIntercept = true
@@ -83,17 +93,23 @@ func accumulateAllowActions(d *Decision, r *compiledRule) {
 	} else if r.authMode == AuthDisable && d.AuthMode == "" {
 		d.AuthMode = AuthDisable
 	}
-	if r.rbiIsolated {
-		d.RBIIsolated = true
-		// Isolation requires decrypt: force TLS intercept when RBI isolates.
-		d.TLSIntercept = true
+
+	if r.rbiExplicit && !d.rbiDecided {
+		d.RBIIsolated = r.rbiIsolated
+		d.rbiDecided = true
+		if d.RBIIsolated {
+			// Isolation requires decrypt.
+			d.TLSIntercept = true
+		}
 	}
+	// Clipboard controls still accumulate if isolation is (or becomes) active.
 	if r.rbiBlockCopyFrom {
 		d.RBIBlockCopyFrom = true
 	}
 	if r.rbiBlockCopyTo {
 		d.RBIBlockCopyTo = true
 	}
+
 	if r.malwareScan {
 		d.MalwareScan = true
 		if r.malwareFailClosed {
@@ -111,4 +127,13 @@ func accumulateAllowActions(d *Decision, r *compiledRule) {
 	if len(r.headerMods) > 0 {
 		d.HeaderMods = append(d.HeaderMods, r.headerMods...)
 	}
+}
+
+func appendUnique(slice []string, v string) []string {
+	for _, s := range slice {
+		if s == v {
+			return slice
+		}
+	}
+	return append(slice, v)
 }

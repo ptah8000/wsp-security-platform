@@ -137,6 +137,7 @@ export type Policy = {
 };
 
 export type SimulateDecision = {
+  url_categories?: string[];
   final_action?: string;
   block_reason?: string;
   block_page_id?: string;

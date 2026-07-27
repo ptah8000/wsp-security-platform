@@ -56,6 +56,13 @@ type Deps struct {
 	Version string
 	// OnDNSServersChanged is invoked when setup/settings update dns_servers (optional).
 	OnDNSServersChanged func(servers []string)
+	// RBI serves /rbi/session/* and /rbi/ws/* on the admin listener (no auth; UUID secret).
+	RBI rbiPathHandler
+}
+
+// rbiPathHandler is implemented by *rbi.Orchestrator.
+type rbiPathHandler interface {
+	ServeRBIPath(w http.ResponseWriter, req *http.Request) bool
 }
 
 // Server is the management HTTP API.
@@ -75,6 +82,7 @@ type Server struct {
 	secureCookie    bool
 	version         string
 	onDNSChanged    func(servers []string)
+	rbi             rbiPathHandler
 
 	// setupComplete overrides Store.IsSetupComplete when non-nil (tests).
 	setupComplete func(ctx context.Context) (bool, error)
@@ -96,6 +104,7 @@ func New(d Deps) *Server {
 		secureCookie:    d.SecureCookie,
 		version:         d.Version,
 		onDNSChanged:    d.OnDNSServersChanged,
+		rbi:             d.RBI,
 	}
 	if s.version == "" {
 		s.version = "0.1.0"
@@ -116,21 +125,37 @@ func New(d Deps) *Server {
 		ContentTypeNosniff:    "nosniff",
 		XFrameOptions:         "SAMEORIGIN",
 		HSTSMaxAge:            0, // admin may be plain HTTP in lab
-		ContentSecurityPolicy: "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'",
+		ContentSecurityPolicy: "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:",
 	}))
 	e.Use(s.loadSession)
 
 	// Unauthenticated liveness (process up).
 	e.GET("/healthz", s.handleHealthz)
 
+	// RBI viewer + WebSocket on the admin plane (session UUID is the capability).
+	// Must be registered before SPA catch-all; no admin login required.
+	e.Any("/rbi/*", s.handleRBI)
+
 	api := e.Group("/api/v1")
 	s.registerAPI(api)
 
-	// Embedded SPA (placeholder until Task 11).
+	// Embedded SPA.
 	s.mountSPA(e)
 
 	s.e = e
 	return s
+}
+
+// handleRBI serves /rbi/session/{id} and /rbi/ws/{id} without admin auth.
+func (s *Server) handleRBI(c echo.Context) error {
+	if s.rbi == nil {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "RBI unavailable")
+	}
+	// ServeRBIPath writes the full response; return nil so Echo does not double-write.
+	if s.rbi.ServeRBIPath(c.Response(), c.Request()) {
+		return nil
+	}
+	return echo.NewHTTPError(http.StatusNotFound, "not found")
 }
 
 // Echo exposes the underlying Echo instance (tests / custom mounts).
@@ -220,6 +245,9 @@ func (s *Server) registerAPI(api *echo.Group) {
 	authz.GET("/objects/:id", s.handleGetObject)
 	authz.PUT("/objects/:id", s.handleUpdateObject)
 	authz.DELETE("/objects/:id", s.handleDeleteObject)
+
+	// URL filter categories (built-in catalog for web filter → RBI layering)
+	authz.GET("/url-categories", s.handleListURLCategories)
 
 	// Policies
 	authz.GET("/policies", s.handleListPolicies)

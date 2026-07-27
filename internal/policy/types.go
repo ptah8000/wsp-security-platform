@@ -39,8 +39,10 @@ const (
 	CondDestinationDomain = "destination_domain"
 	CondDestinationURL    = "destination_url"
 	CondDestinationRegex  = "destination_regex"
-	CondTimeWindow        = "time_window"
-	CondObjectRef         = "object_ref"
+	// CondURLCategory matches built-in URL filter categories (malware, trusted_productivity, …).
+	CondURLCategory = "url_category"
+	CondTimeWindow  = "time_window"
+	CondObjectRef   = "object_ref"
 )
 
 // Object type identifiers stored on reusable_objects.type.
@@ -76,16 +78,22 @@ type Decision struct {
 	RBIIsolated      bool
 	RBIBlockCopyFrom bool
 	RBIBlockCopyTo   bool
-	CASB             []CASBRestriction
-	MalwareScan      bool
+	// URLCategories lists categories matched by any evaluated rule condition (for logs/UI).
+	URLCategories []string
+	CASB          []CASBRestriction
+	MalwareScan   bool
 	// MalwareFailClosed is true when any matching rule sets fail_mode=fail_closed
 	// (OR with global process default applied by the proxy).
 	MalwareFailClosed bool
 	// MalwareMaxBytes is the tightest positive max_scan_bytes from matched rules; 0 = use default.
-	MalwareMaxBytes int64
+	MalwareMaxBytes  int64
 	HeaderMods       []HeaderMod
 	MatchedRuleIDs   []uuid.UUID
 	EvaluatedRuleIDs []uuid.UUID
+	// rbiDecided is true once a rule explicitly set rbi.mode (isolated or not_isolated).
+	// Later rules cannot change isolation — so trusted Allow (not_isolated) wins over a
+	// later “isolate uncategorized” rule. This is “RBI behind URL filtering”.
+	rbiDecided bool
 }
 
 // RequestInput is the pure input for Evaluate / Simulate.

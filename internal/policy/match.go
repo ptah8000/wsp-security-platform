@@ -172,6 +172,14 @@ func (c condAnyUA) match(in RequestInput) bool {
 	return ok
 }
 
+type condURLCategory struct {
+	id string
+}
+
+func (c condURLCategory) match(in RequestInput) bool {
+	return HostInCategory(hostname(in.URL), c.id)
+}
+
 type condAnyDomain struct {
 	domains []string
 }

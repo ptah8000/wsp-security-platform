@@ -293,6 +293,7 @@ func decisionJSON(d policy.Decision) map[string]any {
 		"rbi_isolated":        d.RBIIsolated,
 		"rbi_block_copy_from": d.RBIBlockCopyFrom,
 		"rbi_block_copy_to":   d.RBIBlockCopyTo,
+		"url_categories":      d.URLCategories,
 		"malware_scan":        d.MalwareScan,
 		"casb":                d.CASB,
 		"header_mods":         d.HeaderMods,

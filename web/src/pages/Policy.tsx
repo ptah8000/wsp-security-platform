@@ -118,7 +118,7 @@ export function PolicyListPage() {
     <div>
       <PageHeader
         title="Policies"
-        description="Ordered rules evaluated by priority (top first). Use up/down to reorder."
+        description="Layered model: Block (URL filter) → Allow trusted (no RBI) → Isolate categories/uncategorized (RBI) → malware. First explicit RBI mode wins. Reorder with up/down."
         actions={
           <>
             <Button variant="outline" onClick={() => navigate("/policy/simulate")}>
@@ -275,7 +275,15 @@ export function PolicyEditorPage() {
         );
         setDestText(
           (sec.general?.destinations || [])
-            .map((c) => c.value || c.regex || "")
+            .map((c) => {
+              if (c.type === "url_category" || c.type === "category") {
+                return `category:${c.value || ""}`;
+              }
+              if (c.type === "destination_regex") {
+                return `regex:${c.regex || c.value || ""}`;
+              }
+              return c.value || c.regex || "";
+            })
             .filter(Boolean)
             .join("\n"),
         );
@@ -310,6 +318,11 @@ export function PolicyEditorPage() {
       .map((s) => s.trim())
       .filter(Boolean)
       .map((value) => {
+        const lower = value.toLowerCase();
+        if (lower.startsWith("category:") || lower.startsWith("cat:")) {
+          const id = value.split(":").slice(1).join(":").trim();
+          return { type: "url_category", value: id };
+        }
         if (value.startsWith("regex:")) {
           return { type: "destination_regex", regex: value.slice(6), value: value.slice(6) };
         }
@@ -452,13 +465,13 @@ export function PolicyEditorPage() {
                   </Field>
                   <Field
                     label="Destinations"
-                    hint="One per line: domain, URL, or regex:pattern"
+                    hint="One per line: domain, URL, regex:pattern, or category:id (malware, trusted_productivity, news_media, social_media, streaming, gambling, adult, uncategorized)"
                   >
                     <Textarea
                       className="font-mono text-xs"
                       value={destText}
                       onChange={(e) => setDestText(e.target.value)}
-                      placeholder={"example.com\nhttps://api.example.com/*\nregex:.*\\.evil\\..*"}
+                      placeholder={"category:malware\ncategory:trusted_productivity\nexample.com\nregex:.*\\.evil\\..*"}
                     />
                   </Field>
                 </div>
@@ -764,6 +777,12 @@ export function PolicySimulatePage() {
                   <li>Auth mode: {result.auth_mode || "—"}</li>
                   <li>RBI isolated: {String(!!result.rbi_isolated)}</li>
                   <li>Malware scan: {String(!!result.malware_scan)}</li>
+                  <li>
+                    URL categories:{" "}
+                    {(result.url_categories || []).length
+                      ? (result.url_categories || []).join(", ")
+                      : "—"}
+                  </li>
                 </ul>
                 <div>
                   <div className="mb-1 font-medium text-slate-800">Matched rules</div>

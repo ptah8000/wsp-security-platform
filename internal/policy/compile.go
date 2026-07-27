@@ -38,6 +38,7 @@ type compiledRule struct {
 	authMode     string
 
 	rbiIsolated      bool
+	rbiExplicit      bool // true if rbi.mode was isolated or not_isolated (not empty)
 	rbiBlockCopyFrom bool
 	rbiBlockCopyTo   bool
 
@@ -95,7 +96,8 @@ func compileRule(r Rule, objects map[uuid.UUID]Object) (compiledRule, error) {
 		blockReason:      g.BlockReason,
 		tlsIntercept:     g.TLSIntercept,
 		authMode:         normalizeAuthMode(g.AuthMode),
-		rbiIsolated:      r.Sections.RBI.Mode == RBIIsolated,
+		rbiIsolated:      strings.EqualFold(strings.TrimSpace(r.Sections.RBI.Mode), RBIIsolated),
+		rbiExplicit:      isExplicitRBIMode(r.Sections.RBI.Mode),
 		rbiBlockCopyFrom: r.Sections.RBI.BlockCopyFromSite,
 		rbiBlockCopyTo:   r.Sections.RBI.BlockCopyToSite,
 		malwareScan:      r.Sections.Antimalware.Enabled,
@@ -200,10 +202,21 @@ func normalizeConditionType(typ string) string {
 		return CondUserAgent
 	case "time", CondTimeWindow:
 		return CondTimeWindow
+	case "category", "url-category", CondURLCategory:
+		return CondURLCategory
 	case "object", "ref", CondObjectRef:
 		return CondObjectRef
 	default:
 		return strings.TrimSpace(typ)
+	}
+}
+
+func isExplicitRBIMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case RBIIsolated, RBINotIsolated:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -259,6 +272,16 @@ func compileOneCondition(c Condition, objects map[uuid.UUID]Object) (compiledCon
 			return nil, err
 		}
 		return condAnyRegex{res: []*regexp.Regexp{re}}, nil
+
+	case CondURLCategory:
+		id := strings.ToLower(strings.TrimSpace(c.Value))
+		if id == "" {
+			return nil, fmt.Errorf("empty url_category")
+		}
+		if _, ok := CategoryByID(id); !ok {
+			return nil, fmt.Errorf("unknown url_category %q", id)
+		}
+		return condURLCategory{id: id}, nil
 
 	case CondTimeWindow:
 		tw := TimeWindow{}
