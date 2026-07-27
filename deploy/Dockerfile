@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1
 
 # -----------------------------------------------------------------------------
-# Stage 1: build admin UI (placeholder package.json → web/dist)
+# Stage 1: build admin UI (Vite React + Tailwind → web/dist)
 # -----------------------------------------------------------------------------
 FROM node:20-alpine AS ui
 WORKDIR /src/web
-COPY web/package.json ./
-COPY web/index.html ./
-COPY web/scripts ./scripts
-RUN node ./scripts/build.mjs
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
 
 # -----------------------------------------------------------------------------
 # Stage 2: build Go binary (CGO disabled, embed UI from web/dist)

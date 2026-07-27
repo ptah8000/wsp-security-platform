@@ -2,8 +2,8 @@ package web
 
 import "embed"
 
-// Dist holds built admin SPA static assets.
-// The scaffold ships a placeholder index; the full React app replaces dist/ later.
+// Dist holds built admin SPA static assets (Vite output under dist/).
+// Build with: cd web && npm install && npm run build
 //
 //go:embed all:dist
 var Dist embed.FS

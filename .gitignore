@@ -1,6 +1,5 @@
 bin/
 dist/
-web/dist/
 web/node_modules/
 .env
 *.pem
