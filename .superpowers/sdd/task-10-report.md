@@ -2,7 +2,7 @@
 
 **Status:** DONE  
 **Branch:** `feature/wsp-v1`  
-**Commit:** `3a8d5d8` — `feat: management REST API with setup wizard and operability endpoints`  
+**Commit:** `204d5f7` — `feat: management REST API with setup wizard and operability endpoints`  
 **Author:** WSP Dev \<dev@wsp.local\>  
 **Date:** 2026-07-27
 

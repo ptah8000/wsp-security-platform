@@ -32,5 +32,5 @@ Task 9: complete (RBI orchestrator + CDP viewer WebSocket)
 
 Task 9: complete (commit 6c19ac2, tests pass)
 
-Task 10: complete (commit 3a8d5d8, management REST API + setup wizard + operability endpoints)
+Task 10: complete (commit 204d5f7, management REST API + setup wizard + operability endpoints)
 
