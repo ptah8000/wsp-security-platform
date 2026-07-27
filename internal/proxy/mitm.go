@@ -26,26 +26,18 @@ func (s *Server) handleCONNECT(w http.ResponseWriter, req *http.Request) {
 
 	clientIP := clientIPFromRequest(req)
 	clientIPStr := ipString(clientIP)
-	targetHost := req.Host
-	if targetHost == "" {
-		targetHost = req.URL.Host
+	rawTarget := req.Host
+	if rawTarget == "" {
+		rawTarget = req.URL.Host
 	}
-	if targetHost == "" {
+	if rawTarget == "" {
 		http.Error(w, "CONNECT host required", http.StatusBadRequest)
 		return
 	}
-	// Ensure host:port form; default 443.
-	if !strings.Contains(targetHost, ":") {
-		targetHost = net.JoinHostPort(targetHost, "443")
-	}
-	hostOnly, port, err := net.SplitHostPort(targetHost)
+	hostOnly, _, targetHost, err := parseCONNECTTarget(rawTarget)
 	if err != nil {
 		http.Error(w, "invalid CONNECT host", http.StatusBadRequest)
 		return
-	}
-	if port == "" {
-		port = "443"
-		targetHost = net.JoinHostPort(hostOnly, port)
 	}
 
 	targetURL := &url.URL{Scheme: "https", Host: hostOnly, Path: "/"}
@@ -55,6 +47,13 @@ func (s *Server) handleCONNECT(w http.ResponseWriter, req *http.Request) {
 	username, need407 := s.resolveAuth(req.Context(), req, clientIPStr, d.AuthMode)
 	if need407 {
 		writeProxyAuthRequired(w)
+		pr := &pipelineResult{
+			Input:     in,
+			Decision:  d,
+			RequestID: uuid.New(),
+			Start:     start,
+		}
+		s.recordOutcome(req.Context(), pr, req, targetURL, "auth_required", 0, 0, "proxy authentication required")
 		return
 	}
 	if username != "" {
@@ -271,11 +270,11 @@ func (s *Server) serveBlockedOnTLS(conn net.Conn, connectReq *http.Request, pr *
 	})
 
 	resp := &http.Response{
-		StatusCode: http.StatusForbidden,
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(string(body))),
+		StatusCode:    http.StatusForbidden,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        make(http.Header),
+		Body:          io.NopCloser(strings.NewReader(string(body))),
 		ContentLength: int64(len(body)),
 	}
 	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
@@ -348,10 +347,34 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		return
 	}
 
-	// RBI stub: if policy says isolate and orchestrator handles it, stop.
-	if s.RBI.ShouldIsolate(d) {
-		// RBI needs ResponseWriter; for MITM path, stub never handles.
-		// When real RBI lands it will write viewer HTML here.
+	// RBI fail-closed: never forward origin when isolation is required.
+	if needsIsolation(d, s.RBI) {
+		rw := &mitmResponseWriter{w: clientWriter, header: make(http.Header)}
+		if s.RBI.HandleIsolation(rw, req, d) {
+			s.recordOutcome(req.Context(), pr, req, target, "allow", req.ContentLength, rw.n, "rbi")
+			_ = req.Body.Close()
+			return
+		}
+		d.FinalAction = policy.ActionBlock
+		if d.BlockReason == "" {
+			d.BlockReason = rbiUnavailableReason
+		}
+		pr.Decision = d
+		body := blockpage.Render(s.loadBlockHTML(req.Context(), d.BlockPageID), blockpage.Context{
+			URL: target.String(), Reason: d.BlockReason, Username: username,
+			ClientIP: clientIPStr, Timestamp: time.Now().UTC(),
+		})
+		resp := &http.Response{
+			StatusCode: http.StatusForbidden, ProtoMajor: 1, ProtoMinor: 1,
+			Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))),
+			ContentLength: int64(len(body)), Close: true,
+		}
+		resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+		resp.Header.Set("Cache-Control", "no-store")
+		_ = resp.Write(clientWriter)
+		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(len(body)), "rbi_unavailable")
+		_ = req.Body.Close()
+		return
 	}
 
 	// CASB request-side stub.
@@ -476,13 +499,8 @@ func cloneURL(u *url.URL) *url.URL {
 }
 
 func stripHopByHop(h http.Header) {
-	// RFC 7230 hop-by-hop headers.
-	for _, k := range []string{
-		"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
-		"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
-	} {
-		h.Del(k)
-	}
+	// RFC 7230: Connection token list names additional hop-by-hop headers.
+	// Read Connection BEFORE deleting it, otherwise tokens are never stripped.
 	if c := h.Get("Connection"); c != "" {
 		for _, f := range strings.Split(c, ",") {
 			if f = strings.TrimSpace(f); f != "" {
@@ -490,6 +508,92 @@ func stripHopByHop(h http.Header) {
 			}
 		}
 	}
+	for _, k := range []string{
+		"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+		"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+	} {
+		h.Del(k)
+	}
+}
+
+// parseCONNECTTarget splits a CONNECT authority into host, port, and dial address.
+// Supports hostname, IPv4, IPv6 (bare or bracketed), with optional port (default 443).
+func parseCONNECTTarget(raw string) (host, port, dialAddr string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", "", fmt.Errorf("empty CONNECT host")
+	}
+	// host:port or [ipv6]:port
+	if h, p, e := net.SplitHostPort(raw); e == nil {
+		if p == "" {
+			p = "443"
+		}
+		return h, p, net.JoinHostPort(h, p), nil
+	}
+	// Bare host / IP without port.
+	h := raw
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	}
+	// Accept bare IPv6, IPv4, or hostname without ':'.
+	if net.ParseIP(h) != nil || !strings.Contains(raw, ":") {
+		return h, "443", net.JoinHostPort(h, "443"), nil
+	}
+	return "", "", "", fmt.Errorf("invalid CONNECT host %q", raw)
+}
+
+// mitmResponseWriter adapts an MITM TLS/conn writer to http.ResponseWriter
+// so RBIOrchestrator.HandleIsolation can serve viewer HTML on the MITM path.
+type mitmResponseWriter struct {
+	w           io.Writer
+	header      http.Header
+	status      int
+	wroteHeader bool
+	wrote       bool
+	n           int64
+}
+
+func (m *mitmResponseWriter) Header() http.Header {
+	if m.header == nil {
+		m.header = make(http.Header)
+	}
+	return m.header
+}
+
+func (m *mitmResponseWriter) WriteHeader(statusCode int) {
+	if m.wroteHeader {
+		return
+	}
+	m.status = statusCode
+	m.wroteHeader = true
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	// Minimal HTTP/1.1 response line + headers; body follows via Write.
+	var b strings.Builder
+	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", statusCode, http.StatusText(statusCode))
+	if m.header.Get("Content-Type") == "" {
+		m.header.Set("Content-Type", "text/html; charset=utf-8")
+	}
+	for k, vv := range m.header {
+		for _, v := range vv {
+			fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+		}
+	}
+	b.WriteString("\r\n")
+	n, _ := io.WriteString(m.w, b.String())
+	m.n += int64(n)
+	m.wrote = true
+}
+
+func (m *mitmResponseWriter) Write(p []byte) (int, error) {
+	if !m.wroteHeader {
+		m.WriteHeader(http.StatusOK)
+	}
+	n, err := m.w.Write(p)
+	m.n += int64(n)
+	m.wrote = true
+	return n, err
 }
 
 func (s *Server) idleTimeout() time.Duration {

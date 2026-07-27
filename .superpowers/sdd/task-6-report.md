@@ -120,7 +120,7 @@ Store request_log / session persistence paths need `WSP_DATABASE_URL` + `//go:bu
 
 1. **Origin TLS verification** uses system roots by default; lab origins with private certs need transport injection (tests use `InsecureSkipVerify` on origin side only).
 2. **Malware scan** is a no-op stub — bodies are not buffered; real ClamAV wiring is Task 7.
-3. **RBI / CASB** stubs do not alter traffic; isolated rules currently still forward until RBI task.
+3. **CASB** stub does not alter traffic until Task 8. **RBI** is fail-closed (see follow-up below): when `RBIIsolated`/`ShouldIsolate` and `HandleIsolation` returns false, origin is never forwarded.
 4. **CONNECT block without MITM** returns short text 403 (cannot render HTML inside CONNECT).
 5. **Policy hot-reload** not implemented — engine loaded once at startup.
 6. **HTTP/2 to client** on MITM is not negotiated (HTTP/1.1 over MITM TLS).
@@ -137,3 +137,38 @@ Store request_log / session persistence paths need `WSP_DATABASE_URL` + `//go:bu
 - [x] Step 4: Recorder → request_logs fields (minimum set + actions/timings)  
 - [x] Step 5: Integration test TLS origin + MITM + log assert  
 - [x] Step 6: Commit `feat: explicit MITM proxy with policy and request logs`  
+
+---
+
+## Follow-up: review findings (RBI fail-closed + hygiene)
+
+**Status:** DONE  
+**Commit message:** `fix: proxy RBI fail-closed and hop-by-hop auth hygiene`  
+**Author:** WSP Dev \<dev@wsp.local\>  
+**Date:** 2026-07-27
+
+### CRITICAL
+
+1. **RBI fail-closed (HTTP + MITM)**  
+   - Isolation is required when `d.RBIIsolated` **or** `RBI.ShouldIsolate(d)`.  
+   - If `HandleIsolation` returns false, serve block page (`rbiUnavailableReason`) and **never** `RoundTrip` origin.  
+   - Helper: `needsIsolation`. MITM path uses `mitmResponseWriter` so real RBI can still write viewer HTML later.  
+   - Regression: `TestRBIFailClosed_HTTPDoesNotForward`, `TestNeedsIsolation`.
+
+### IMPORTANT
+
+2. **`stripHopByHop`** — read `Connection` token list **before** deleting `Connection` so named hop-by-hop headers are removed (`TestStripHopByHop_ConnectionTokens`).
+3. **`ensureHooks`** — `sync.Once` (`hooksOnce`) so concurrent request paths cannot race default field assignment; still callable from `Start` and tests without `Start`.
+4. **`AuthDisable`** — ignore `Proxy-Authorization` when mode is empty/`disable`; unverified credentials must not become session/log username (`TestResolveAuth_DisableIgnoresProxyAuthorization`).
+
+### Optional (done)
+
+5. **IPv6 CONNECT** — `parseCONNECTTarget` supports bare/bracketed IPv6, host:port, default 443 (`TestParseCONNECTTarget_IPv6AndHost`).
+6. **407 logging** — HTTP and CONNECT paths record decision `auth_required` with error `proxy authentication required` before return.
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `go test ./internal/proxy/... ./internal/...` | PASS |
+| Commit message | `fix: proxy RBI fail-closed and hop-by-hop auth hygiene` |

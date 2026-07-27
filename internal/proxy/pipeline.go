@@ -108,12 +108,9 @@ func (s *Server) evaluate(in policy.RequestInput) policy.Decision {
 
 // resolveAuth enforces proxy auth based on decision.AuthMode.
 // Returns username, whether auth failed (caller should 407), and optional www-auth.
+// When AuthMode is disable/empty, Proxy-Authorization is ignored (never treated as identity).
 func (s *Server) resolveAuth(ctx context.Context, req *http.Request, clientIP string, mode string) (username string, need407 bool) {
 	if mode == "" || mode == policy.AuthDisable {
-		// Still surface any provided credentials for logging.
-		if u, _, ok := proxyBasicAuth(req); ok {
-			return u, false
-		}
 		return "", false
 	}
 
@@ -339,35 +336,57 @@ func clientIPFromRequest(req *http.Request) net.IP {
 }
 
 // ensureHooks fills default stubs when interfaces are nil.
+// Safe for concurrent callers: initialization runs at most once (sync.Once).
+// Prefer calling from Start; request paths also call for tests that skip Start.
 func (s *Server) ensureHooks() {
-	if s.CASB == nil {
-		s.CASB = noopCASB{}
+	if s == nil {
+		return
 	}
-	if s.Malware == nil {
-		s.Malware = noopMalware{}
-	}
-	if s.RBI == nil {
-		s.RBI = noopRBI{}
-	}
-	if s.Sessions == nil {
-		s.Sessions = NewSessionTracker(s.Store, DefaultSessionIdle)
-	}
-	if s.Dialer == nil {
-		s.Dialer = &net.Dialer{Timeout: 30 * time.Second}
-	}
-	if s.Transport == nil {
-		s.Transport = &http.Transport{
-			Proxy:                 nil, // never chain
-			DialContext:           s.Dialer.DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			// Origin TLS: system roots (MITM is client-side only).
+	s.hooksOnce.Do(func() {
+		if s.CASB == nil {
+			s.CASB = noopCASB{}
 		}
-	}
+		if s.Malware == nil {
+			s.Malware = noopMalware{}
+		}
+		if s.RBI == nil {
+			s.RBI = noopRBI{}
+		}
+		if s.Sessions == nil {
+			s.Sessions = NewSessionTracker(s.Store, DefaultSessionIdle)
+		}
+		if s.Dialer == nil {
+			s.Dialer = &net.Dialer{Timeout: 30 * time.Second}
+		}
+		if s.Transport == nil {
+			s.Transport = &http.Transport{
+				Proxy:                 nil, // never chain
+				DialContext:           s.Dialer.DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+				// Origin TLS: system roots (MITM is client-side only).
+			}
+		}
+	})
 }
+
+// needsIsolation reports whether this request must be handled by RBI (fail-closed).
+// Checks Decision.RBIIsolated explicitly, and RBIOrchestrator.ShouldIsolate.
+func needsIsolation(d policy.Decision, rbi RBIOrchestrator) bool {
+	if d.RBIIsolated {
+		return true
+	}
+	if rbi != nil && rbi.ShouldIsolate(d) {
+		return true
+	}
+	return false
+}
+
+// rbiUnavailableReason is served when isolation is required but HandleIsolation fails.
+const rbiUnavailableReason = "Remote browser isolation required but unavailable"
 
 // decisionLabel maps FinalAction to log decision string, with overrides.
 func decisionLabel(d policy.Decision, override string) string {

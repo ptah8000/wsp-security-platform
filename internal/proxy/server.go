@@ -50,6 +50,7 @@ type Server struct {
 
 	httpServer *http.Server
 	mu         sync.Mutex
+	hooksOnce  sync.Once
 }
 
 // Start listens on Addr and serves until ctx is cancelled or Shutdown.
@@ -178,6 +179,13 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	username, need407 := s.resolveAuth(req.Context(), req, clientIPStr, d.AuthMode)
 	if need407 {
 		writeProxyAuthRequired(w)
+		pr := &pipelineResult{
+			Input:     in,
+			Decision:  d,
+			RequestID: uuid.New(),
+			Start:     start,
+		}
+		s.recordOutcome(req.Context(), pr, req, target, "auth_required", req.ContentLength, 0, "proxy authentication required")
 		return
 	}
 	if username != "" {
@@ -202,8 +210,19 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if s.RBI.ShouldIsolate(d) && s.RBI.HandleIsolation(w, req, d) {
-		s.recordOutcome(req.Context(), pr, req, target, "allow", req.ContentLength, 0, "rbi")
+	// RBI fail-closed: never forward origin when isolation is required.
+	if needsIsolation(d, s.RBI) {
+		if s.RBI.HandleIsolation(w, req, d) {
+			s.recordOutcome(req.Context(), pr, req, target, "allow", req.ContentLength, 0, "rbi")
+			return
+		}
+		d.FinalAction = policy.ActionBlock
+		if d.BlockReason == "" {
+			d.BlockReason = rbiUnavailableReason
+		}
+		pr.Decision = d
+		n := s.writeBlockPage(w, req, d, clientIPStr, username, target)
+		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(n), "rbi_unavailable")
 		return
 	}
 
