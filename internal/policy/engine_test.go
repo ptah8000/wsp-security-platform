@@ -402,6 +402,84 @@ func TestTimeWindow(t *testing.T) {
 	}
 }
 
+// TestOvernightTimeWindow covers startMin > endMin (e.g. 22:00–06:00):
+// match when mins >= startMin || mins < endMin.
+func TestOvernightTimeWindow(t *testing.T) {
+	rules := []Rule{
+		{
+			ID:       ruleID(1),
+			Name:     "overnight-block",
+			Enabled:  true,
+			Priority: 10,
+			Sections: RuleSections{
+				General: GeneralSection{
+					Action:      ActionBlock,
+					BlockReason: "overnight window",
+				},
+				WebFiltering: WebFilteringSection{
+					TimeWindows: []TimeWindow{
+						{
+							StartTime: "22:00",
+							EndTime:   "06:00",
+							Timezone:  "UTC",
+						},
+					},
+				},
+			},
+		},
+	}
+	snap, err := Compile(rules, nil)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	var eng Engine
+	eng.Swap(snap)
+
+	in := baseInput(t)
+
+	// Inside: late night (mins >= startMin)
+	in.Now = time.Date(2026, 7, 27, 23, 30, 0, 0, time.UTC)
+	d := eng.Evaluate(in)
+	if d.FinalAction != ActionBlock {
+		t.Fatalf("23:30 in overnight window: FinalAction = %q, want block", d.FinalAction)
+	}
+
+	// Inside: exactly at start
+	in.Now = time.Date(2026, 7, 27, 22, 0, 0, 0, time.UTC)
+	d = eng.Evaluate(in)
+	if d.FinalAction != ActionBlock {
+		t.Fatalf("22:00 at overnight start: FinalAction = %q, want block", d.FinalAction)
+	}
+
+	// Inside: early morning (mins < endMin)
+	in.Now = time.Date(2026, 7, 28, 3, 0, 0, 0, time.UTC)
+	d = eng.Evaluate(in)
+	if d.FinalAction != ActionBlock {
+		t.Fatalf("03:00 in overnight window: FinalAction = %q, want block", d.FinalAction)
+	}
+
+	// Outside: end is exclusive
+	in.Now = time.Date(2026, 7, 28, 6, 0, 0, 0, time.UTC)
+	d = eng.Evaluate(in)
+	if d.FinalAction != ActionAllow {
+		t.Fatalf("06:00 at overnight end (exclusive): FinalAction = %q, want allow", d.FinalAction)
+	}
+
+	// Outside: midday
+	in.Now = time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	d = eng.Evaluate(in)
+	if d.FinalAction != ActionAllow {
+		t.Fatalf("12:00 outside overnight window: FinalAction = %q, want allow", d.FinalAction)
+	}
+
+	// Outside: just before start
+	in.Now = time.Date(2026, 7, 27, 21, 59, 0, 0, time.UTC)
+	d = eng.Evaluate(in)
+	if d.FinalAction != ActionAllow {
+		t.Fatalf("21:59 outside overnight window: FinalAction = %q, want allow", d.FinalAction)
+	}
+}
+
 func TestDisabledRulesSkipped(t *testing.T) {
 	rules := []Rule{
 		{

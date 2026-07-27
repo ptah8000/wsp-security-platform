@@ -331,22 +331,21 @@ func (w compiledTimeWindow) contains(now time.Time) bool {
 
 	if w.hasClock {
 		mins := local.Hour()*60 + local.Minute()
-		if w.startMin >= 0 && mins < w.startMin {
-			return false
-		}
-		if w.endMin >= 0 && mins >= w.endMin {
-			// End is exclusive at exact end minute boundary: 17:00 means until 17:00 not including.
-			// Design: "09:00–17:00" business hours → 16:59 in, 17:00 out.
-			return false
-		}
-		// Handle overnight windows (e.g. 22:00–06:00) when both set and start > end.
+		// Overnight windows (e.g. 22:00–06:00): startMin > endMin wraps past midnight.
+		// Match with mins >= startMin || mins < endMin (end exclusive, same as same-day windows).
 		if w.startMin >= 0 && w.endMin >= 0 && w.startMin > w.endMin {
-			// mins is inside if >= start OR < end (already checked mins >= end as fail for normal).
-			// For overnight: fail if end <= mins < start.
-			if mins >= w.endMin && mins < w.startMin {
+			if !(mins >= w.startMin || mins < w.endMin) {
 				return false
 			}
-			return true
+		} else {
+			if w.startMin >= 0 && mins < w.startMin {
+				return false
+			}
+			if w.endMin >= 0 && mins >= w.endMin {
+				// End is exclusive at exact end minute boundary: 17:00 means until 17:00 not including.
+				// Design: "09:00–17:00" business hours → 16:59 in, 17:00 out.
+				return false
+			}
 		}
 	}
 
