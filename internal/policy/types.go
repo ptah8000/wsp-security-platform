@@ -78,6 +78,11 @@ type Decision struct {
 	RBIBlockCopyTo   bool
 	CASB             []CASBRestriction
 	MalwareScan      bool
+	// MalwareFailClosed is true when any matching rule sets fail_mode=fail_closed
+	// (OR with global process default applied by the proxy).
+	MalwareFailClosed bool
+	// MalwareMaxBytes is the tightest positive max_scan_bytes from matched rules; 0 = use default.
+	MalwareMaxBytes int64
 	HeaderMods       []HeaderMod
 	MatchedRuleIDs   []uuid.UUID
 	EvaluatedRuleIDs []uuid.UUID

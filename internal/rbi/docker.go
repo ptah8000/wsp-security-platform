@@ -82,12 +82,14 @@ type createContainerBody struct {
 }
 
 type hostConfigBody struct {
-	Memory       int64                          `json:"Memory"`
-	AutoRemove   bool                           `json:"AutoRemove"`
-	CapDrop      []string                       `json:"CapDrop,omitempty"`
-	SecurityOpt  []string                       `json:"SecurityOpt,omitempty"`
-	PortBindings map[string][]portBindingBody   `json:"PortBindings,omitempty"`
-	NetworkMode  string                         `json:"NetworkMode,omitempty"`
+	Memory       int64                        `json:"Memory"`
+	NanoCPUs     int64                        `json:"NanoCpus,omitempty"`
+	PidsLimit    int64                        `json:"PidsLimit,omitempty"`
+	AutoRemove   bool                         `json:"AutoRemove"`
+	CapDrop      []string                     `json:"CapDrop,omitempty"`
+	SecurityOpt  []string                     `json:"SecurityOpt,omitempty"`
+	PortBindings map[string][]portBindingBody `json:"PortBindings,omitempty"`
+	NetworkMode  string                       `json:"NetworkMode,omitempty"`
 }
 
 type portBindingBody struct {
@@ -155,6 +157,27 @@ func (d *DockerRuntime) CreateAndStart(ctx context.Context, opts CreateOpts) (Co
 		labels[k] = v
 	}
 
+	// Attach to the gateway Compose network when set so CDP is reachable via
+	// container IP (published 127.0.0.1 ports are NOT visible from sibling containers).
+	hc := hostConfigBody{
+		Memory:      mem,
+		NanoCPUs:    1_000_000_000, // 1 CPU
+		PidsLimit:   512,
+		AutoRemove:  false,
+		CapDrop:     []string{"ALL"},
+		SecurityOpt: []string{"no-new-privileges:true"},
+		// Publish a host port as fallback for CDPHost / host.docker.internal.
+		PortBindings: map[string][]portBindingBody{
+			portKey: {{
+				HostIP:   "0.0.0.0",
+				HostPort: "0",
+			}},
+		},
+	}
+	if opts.Network != "" {
+		hc.NetworkMode = opts.Network
+	}
+
 	body := createContainerBody{
 		Image:  opts.Image,
 		Env:    []string{"CONNECTION_TIMEOUT=600000", "DEFAULT_BLOCK_ADS=false"},
@@ -162,19 +185,7 @@ func (d *DockerRuntime) CreateAndStart(ctx context.Context, opts CreateOpts) (Co
 		ExposedPorts: map[string]struct{}{
 			portKey: {},
 		},
-		HostConfig: hostConfigBody{
-			Memory:      mem,
-			AutoRemove:  false,
-			CapDrop:     []string{"ALL"},
-			SecurityOpt: []string{"no-new-privileges:true"},
-			PortBindings: map[string][]portBindingBody{
-				portKey: {{
-					HostIP:   "127.0.0.1",
-					HostPort: "0",
-				}},
-			},
-			NetworkMode: opts.Network,
-		},
+		HostConfig: hc,
 	}
 
 	id, err := d.API.ContainerCreate(ctx, body, opts.Name)
@@ -256,18 +267,17 @@ func (d *DockerRuntime) ensureImage(ctx context.Context, ref string) error {
 }
 
 func (d *DockerRuntime) resolveCDPAddr(info ContainerInfo) string {
-	if d != nil && d.CDPHost != "" && info.HostPort != "" {
-		return net.JoinHostPort(d.CDPHost, info.HostPort)
-	}
+	// Prefer container IP on a shared Docker network (works from the gateway container).
 	if info.IPAddress != "" {
 		return net.JoinHostPort(info.IPAddress, strconv.Itoa(info.ContainerPort))
 	}
+	// Explicit CDP host (e.g. host.docker.internal) + published host port.
+	if d != nil && d.CDPHost != "" && info.HostPort != "" {
+		return net.JoinHostPort(d.CDPHost, info.HostPort)
+	}
+	// Last resort: published port on loopback (only when gateway runs on the host).
 	if info.HostPort != "" {
-		host := "127.0.0.1"
-		if d != nil && d.CDPHost != "" {
-			host = d.CDPHost
-		}
-		return net.JoinHostPort(host, info.HostPort)
+		return net.JoinHostPort("127.0.0.1", info.HostPort)
 	}
 	return ""
 }

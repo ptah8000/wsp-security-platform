@@ -279,7 +279,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	// Request-body malware scan (uploads) when policy enables it.
 	reqSize := req.ContentLength
 	if d.MalwareScan && req.Body != nil && req.Body != http.NoBody {
-		out := s.scanHTTPBody(req.Context(), req.Body, req.ContentLength)
+		out := s.scanHTTPBody(req.Context(), req.Body, req.ContentLength, d)
 		req.Body = out.Body
 		// Only rewrite Content-Length when the body was fully buffered (not oversize pass-through).
 		if out.ErrMsg != "malware_skipped_oversize" && out.Size >= 0 && req.Body != http.NoBody {
@@ -332,7 +332,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Response-body malware scan when policy enables it.
 	if d.MalwareScan {
-		out := s.scanHTTPBody(req.Context(), resp.Body, resp.ContentLength)
+		out := s.scanHTTPBody(req.Context(), resp.Body, resp.ContentLength, d)
 		resp.Body = out.Body
 		if out.Size > 0 && out.ErrMsg != "malware_skipped_oversize" {
 			resp.ContentLength = out.Size

@@ -2,7 +2,7 @@
 
 **Status:** DONE  
 **Branch:** `feature/wsp-v1`  
-**Commit:** `3191b9d` — `docs: README and compose production-ready defaults`  
+**Commit:** `a2a64f3` — `docs: README and compose production-ready defaults`  
 **Author:** WSP Dev \<dev@wsp.local\>  
 **Date:** 2026-07-27
 

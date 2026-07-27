@@ -180,3 +180,49 @@ Also: `gofmt` clean, `go vet ./internal/policy/` clean.
 | `go test ./internal/policy/` | PASS |
 | `go vet ./internal/policy/` | PASS |
 | Commit | `53523b4` |
+
+---
+
+## Follow-up: overnight time window matching
+
+**Status:** DONE  
+**Commit:** `db47375` — `fix: policy overnight time window matching`  
+**Author:** WSP Dev \<dev@wsp.local\>  
+**Date:** 2026-07-27
+
+### Bug
+
+`compiledTimeWindow.contains` applied same-day clock bounds (`mins < startMin` / `mins >= endMin`) **before** the overnight branch. For windows with `startMin > endMin` (e.g. `22:00`–`06:00`), valid times failed incorrectly:
+
+- `23:30` → rejected by `mins >= endMin` (1380 ≥ 360)
+- `03:00` → rejected by `mins < startMin` (180 < 1320)
+
+### Fix
+
+In `internal/policy/match.go`, when both clock bounds are set and `startMin > endMin`, match with:
+
+```text
+mins >= startMin || mins < endMin
+```
+
+(end exclusive, same as same-day windows). Same-day windows keep the previous inclusive-start / exclusive-end logic.
+
+### Regression test
+
+`TestOvernightTimeWindow` in `internal/policy/engine_test.go` covers:
+
+| Local time (UTC) | Expected |
+|------------------|----------|
+| 22:00 (start) | in window (block) |
+| 23:30 | in window (block) |
+| 03:00 | in window (block) |
+| 06:00 (end exclusive) | out (allow) |
+| 12:00 | out (allow) |
+| 21:59 | out (allow) |
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `go test ./internal/policy/...` | PASS |
+| Commit | `db47375` |

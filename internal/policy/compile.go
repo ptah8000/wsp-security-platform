@@ -41,9 +41,11 @@ type compiledRule struct {
 	rbiBlockCopyFrom bool
 	rbiBlockCopyTo   bool
 
-	casb        []CASBRestriction
-	malwareScan bool
-	headerMods  []HeaderMod
+	casb              []CASBRestriction
+	malwareScan       bool
+	malwareFailClosed bool
+	malwareMaxBytes   int64
+	headerMods        []HeaderMod
 }
 
 // Compile builds an immutable Snapshot from rules and reusable objects.
@@ -97,8 +99,10 @@ func compileRule(r Rule, objects map[uuid.UUID]Object) (compiledRule, error) {
 		rbiBlockCopyFrom: r.Sections.RBI.BlockCopyFromSite,
 		rbiBlockCopyTo:   r.Sections.RBI.BlockCopyToSite,
 		malwareScan:      r.Sections.Antimalware.Enabled,
-		methods:          append([]string(nil), w.Methods...),
-		protocols:        append([]string(nil), w.Protocols...),
+		malwareFailClosed: strings.EqualFold(strings.TrimSpace(r.Sections.Antimalware.FailMode), "fail_closed"),
+		malwareMaxBytes:   r.Sections.Antimalware.MaxScanBytes,
+		methods:           append([]string(nil), w.Methods...),
+		protocols:         append([]string(nil), w.Protocols...),
 	}
 
 	var err error
@@ -179,8 +183,32 @@ func compileConditions(conds []Condition, objects map[uuid.UUID]Object) ([]compi
 	return out, nil
 }
 
+// normalizeConditionType maps short aliases used in UI/API to canonical types.
+func normalizeConditionType(typ string) string {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "domain", "host", "hostname", CondDestinationDomain:
+		return CondDestinationDomain
+	case "url", CondDestinationURL:
+		return CondDestinationURL
+	case "regex", CondDestinationRegex:
+		return CondDestinationRegex
+	case "ip", "cidr", "src_ip", CondSourceIP:
+		return CondSourceIP
+	case "user", "username", CondSourceUser:
+		return CondSourceUser
+	case "ua", CondUserAgent:
+		return CondUserAgent
+	case "time", CondTimeWindow:
+		return CondTimeWindow
+	case "object", "ref", CondObjectRef:
+		return CondObjectRef
+	default:
+		return strings.TrimSpace(typ)
+	}
+}
+
 func compileOneCondition(c Condition, objects map[uuid.UUID]Object) (compiledCond, error) {
-	typ := c.Type
+	typ := normalizeConditionType(c.Type)
 	if typ == CondObjectRef || c.ObjectID != nil {
 		if c.ObjectID == nil {
 			return nil, fmt.Errorf("object_ref missing object_id")

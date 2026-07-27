@@ -34,3 +34,14 @@ Task 9: complete (commit 6c19ac2, tests pass)
 
 Task 10: complete (commit 204d5f7, management REST API + setup wizard + operability endpoints)
 
+Task 10: complete (commits 204d5f7..284e679, tests pass)
+
+Task 11: complete (commit 5271bd0, build+go embed ok)
+
+Task 12: complete (commit 4c40c1c)
+Task 13: complete (commit a2a64f3)
+
+Task 14: complete (unit+build pass; Compose E2E deferred - no Docker daemon)
+
+Task 14: complete after Critical RBI CONNECT fix a8ad8ed; final review conditions met for merge readiness
+

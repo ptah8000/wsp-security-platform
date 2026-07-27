@@ -27,12 +27,18 @@ func (s *Server) handleClientSetup(c echo.Context) error {
 		}
 	}
 
-	proxyHost := hostFromAddr(s.proxyAddr, "PROXY_HOST")
-	proxyPort := portFromAddr(s.proxyAddr, "8080")
+	proxyHost := strings.TrimSpace(s.publicProxyHost)
+	if proxyHost == "" {
+		proxyHost = hostFromAddr(s.proxyAddr, "PROXY_HOST")
+	}
+	proxyPort := strings.TrimSpace(s.publicProxyPort)
+	if proxyPort == "" {
+		proxyPort = portFromAddr(s.proxyAddr, "8080")
+	}
 	adminBase := strings.TrimRight(c.Scheme()+"://"+c.Request().Host, "/")
 
 	pac := fmt.Sprintf(`function FindProxyForURL(url, host) {
-  // WSP explicit proxy PAC (lab example)
+  // WSP explicit proxy PAC
   if (isPlainHostName(host) ||
       shExpMatch(host, "localhost") ||
       shExpMatch(host, "127.*") ||
@@ -51,10 +57,13 @@ func (s *Server) handleClientSetup(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"proxy": map[string]any{
-			"listen": s.proxyAddr,
-			"host":   proxyHost,
-			"port":   proxyPort,
-			"type":   "explicit",
+			"listen":      s.proxyAddr,
+			"host":        proxyHost,
+			"port":        proxyPort,
+			"type":        "explicit",
+			"curl_http":   fmt.Sprintf("curl.exe -x http://%s:%s http://example.com/", proxyHost, proxyPort),
+			"curl_https":  fmt.Sprintf("curl.exe -x http://%s:%s -k https://example.com/   # -k until CA is trusted", proxyHost, proxyPort),
+			"browser_set": fmt.Sprintf("HTTP/HTTPS proxy = %s  port = %s", proxyHost, proxyPort),
 		},
 		"ca": map[string]any{
 			"active":             activeCA != nil,
@@ -72,12 +81,15 @@ func (s *Server) handleClientSetup(c echo.Context) error {
 			"Configure user/computer proxy via PAC URL or static PROXY host:port.",
 			"For Chromium, ensure the enterprise policy CertificateTransparencyEnforcementDisabledForCas is not needed for private CAs in most lab setups.",
 			"Firefox uses its own cert store — import the CA into Firefox or enable enterprise roots on Windows.",
+			"Windows: certutil -addstore -f ROOT path\\to\\wsp-ca.pem (elevated) then restart the browser.",
 		},
 		"troubleshooting": []string{
-			"NET::ERR_CERT_AUTHORITY_INVALID — client does not trust the WSP CA; re-import public PEM.",
-			"Proxy connection failed — verify client can reach proxy listen address and no local firewall blocks it.",
+			"NET::ERR_CERT_AUTHORITY_INVALID — client does not trust the WSP CA; re-import public PEM into system or browser trust store.",
+			"Windows curl uses SChannel and may ignore --cacert; use -k for lab tests or import the CA into Windows Trusted Root.",
+			"Proxy connection failed — verify client can reach the published host port (Compose may map host 18080 → container 8080 on Windows).",
 			"HTTPS sites work without inspection — policy may have tls_intercept=false for that destination.",
 			"Intermittent TLS errors after CA rotation — regenerate/redistribute CA and clear browser TLS state.",
+			"RBI degraded — ensure the Docker socket is mounted and the wsp container has permission (group_add docker/root GID).",
 		},
 	})
 }

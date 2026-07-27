@@ -164,6 +164,9 @@ func (s *Server) handleSetupNetwork(c echo.Context) error {
 	if err := s.store.SetSetting(c.Request().Context(), store.SettingDNSServers, raw); err != nil {
 		return err
 	}
+	if s.onDNSChanged != nil {
+		s.onDNSChanged(req.DNSServers)
+	}
 
 	// Persist listen hints from process config for UI display.
 	if s.proxyAddr != "" {

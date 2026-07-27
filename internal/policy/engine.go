@@ -96,6 +96,14 @@ func accumulateAllowActions(d *Decision, r *compiledRule) {
 	}
 	if r.malwareScan {
 		d.MalwareScan = true
+		if r.malwareFailClosed {
+			d.MalwareFailClosed = true
+		}
+		if r.malwareMaxBytes > 0 {
+			if d.MalwareMaxBytes == 0 || r.malwareMaxBytes < d.MalwareMaxBytes {
+				d.MalwareMaxBytes = r.malwareMaxBytes
+			}
+		}
 	}
 	if len(r.casb) > 0 {
 		d.CASB = append(d.CASB, r.casb...)

@@ -70,15 +70,18 @@ func (s *Server) handlePutSetting(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusBadRequest, "retention days must be an integer 1..3650")
 		}
 	}
+	var dnsServers []string
 	if key == store.SettingDNSServers {
-		var servers []string
-		if err := json.Unmarshal(req.Value, &servers); err != nil || len(servers) == 0 {
+		if err := json.Unmarshal(req.Value, &dnsServers); err != nil || len(dnsServers) == 0 {
 			return echo.NewHTTPError(http.StatusBadRequest, "dns_servers must be a non-empty JSON array of strings")
 		}
 	}
 
 	if err := s.store.SetSetting(c.Request().Context(), key, req.Value); err != nil {
 		return err
+	}
+	if key == store.SettingDNSServers && s.onDNSChanged != nil {
+		s.onDNSChanged(dnsServers)
 	}
 	s.writeAudit(c, "settings.update", "settings", key, "Updated setting "+key, nil)
 	st, err := s.store.GetSettingRow(c.Request().Context(), key)

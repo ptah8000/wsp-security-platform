@@ -205,9 +205,20 @@ func TestDockerRuntime_PreferContainerIP(t *testing.T) {
 	if addr != "10.0.0.5:3000" {
 		t.Fatalf("addr=%q", addr)
 	}
+	// Container IP still preferred when CDPHost is set (shared-network CDP).
 	rt.CDPHost = "127.0.0.1"
 	addr = rt.resolveCDPAddr(ContainerInfo{IPAddress: "10.0.0.5", ContainerPort: 3000, HostPort: "12345"})
+	if addr != "10.0.0.5:3000" {
+		t.Fatalf("addr with CDPHost should still prefer IP, got %q", addr)
+	}
+	// HostPort + CDPHost only when no container IP (sibling network missing).
+	addr = rt.resolveCDPAddr(ContainerInfo{HostPort: "12345"})
 	if addr != "127.0.0.1:12345" {
-		t.Fatalf("addr with CDPHost=%q", addr)
+		t.Fatalf("hostport fallback=%q", addr)
+	}
+	rt.CDPHost = "host.docker.internal"
+	addr = rt.resolveCDPAddr(ContainerInfo{HostPort: "12345"})
+	if addr != "host.docker.internal:12345" {
+		t.Fatalf("cdp host fallback=%q", addr)
 	}
 }

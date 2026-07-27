@@ -429,7 +429,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, br *bufio.Reader, req
 	// Request-body malware scan when policy enables it.
 	reqSize := req.ContentLength
 	if d.MalwareScan && req.Body != nil && req.Body != http.NoBody {
-		out := s.scanHTTPBody(req.Context(), req.Body, req.ContentLength)
+		out := s.scanHTTPBody(req.Context(), req.Body, req.ContentLength, d)
 		req.Body = out.Body
 		if out.ErrMsg != "malware_skipped_oversize" && out.Size >= 0 && req.Body != http.NoBody {
 			req.ContentLength = out.Size
@@ -493,7 +493,7 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, br *bufio.Reader, req
 
 	// Response-body malware scan when policy enables it.
 	if d.MalwareScan {
-		out := s.scanHTTPBody(req.Context(), resp.Body, resp.ContentLength)
+		out := s.scanHTTPBody(req.Context(), resp.Body, resp.ContentLength, d)
 		resp.Body = out.Body
 		if out.Size > 0 && out.ErrMsg != "malware_skipped_oversize" {
 			resp.ContentLength = out.Size

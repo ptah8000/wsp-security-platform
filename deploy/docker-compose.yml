@@ -4,9 +4,17 @@
 #   cp env.example .env
 #   # set WSP_DATA_KEY=$(openssl rand -base64 32)
 #   docker compose up -d --build
-#   ./smoke.sh
+#   ./smoke.sh   (or open http://127.0.0.1:3000)
 #
-# Ports: proxy 8080, admin 3000. RBI needs the Docker socket mount.
+# Host ports (Windows often blocks 8080 via Hyper-V):
+#   Admin UI  → http://127.0.0.1:3000
+#   Proxy     → http://127.0.0.1:18080  (container :8080)
+
+name: wsp
+
+networks:
+  default:
+    name: wsp_net
 
 services:
   postgres:
@@ -24,16 +32,14 @@ services:
       retries: 10
       start_period: 10s
     restart: unless-stopped
-    # Lab default: not published. Uncomment to debug from the host:
-    # ports:
-    #   - "5432:5432"
+    networks: [default]
 
   clamav:
     image: clamav/clamav:stable
-    # clamd listens on 3310 on the Compose network only (no host publish).
-    # First start downloads signatures and can take several minutes; wsp malware
-    # defaults to fail-open so the proxy can start before clamd is ready.
+    # clamd listens on 3310 on the Compose network only.
+    # First start downloads signatures (several minutes); malware defaults to fail-open.
     restart: unless-stopped
+    networks: [default]
 
   wsp:
     build:
@@ -44,11 +50,25 @@ services:
       WSP_DATABASE_URL: postgres://wsp:wsp@postgres:5432/wsp?sslmode=disable
       WSP_CLAMD_ADDR: clamav:3310
       DOCKER_HOST: unix:///var/run/docker.sock
+      # RBI containers join this network so CDP is reachable via container IP.
+      WSP_RBI_NETWORK: wsp_net
+      # Client Setup / PAC (host-facing proxy port).
+      WSP_PUBLIC_PROXY_HOST: 127.0.0.1
+      WSP_PUBLIC_PROXY_PORT: "18080"
+    # Distroless runs as nonroot (uid 65532). Docker Desktop mounts the socket
+    # as root:root mode 660 — supplementary group 0 is required for RBI.
+    # On Linux: set DOCKER_GID to the docker group (getent group docker | cut -d: -f3)
+    # and group_add: ["${DOCKER_GID}"].
+    group_add:
+      - "${DOCKER_GID:-0}"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
-      - "8080:8080"
+      - "18080:8080"
       - "3000:3000"
     volumes:
-      # Required for RBI (ephemeral Chromium). Equivalent to host root — see README security notes.
+      # Required for RBI. Socket access ≈ host root — see README security notes.
       - /var/run/docker.sock:/var/run/docker.sock
       - wsp_data:/var/lib/wsp
     depends_on:
@@ -56,11 +76,8 @@ services:
         condition: service_healthy
       clamav:
         condition: service_started
-    # Prefer restart after crash once DB is up; clam may still be loading (fail-open malware default).
     restart: unless-stopped
-    # Distroless has no shell/curl. Probe externally with deploy/smoke.sh → GET /healthz.
-    # RBI: socket is often root:docker — if isolation cannot talk to Docker, run with a
-    # matching group_add DOCKER_GID or document host permissions (see README security).
+    networks: [default]
 
 volumes:
   pgdata:

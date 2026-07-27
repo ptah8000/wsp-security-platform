@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -155,6 +156,9 @@ func run(ctx context.Context, cfg config.Config) error {
 		"batch_size", logging.DefaultRetentionBatchSize,
 	)
 
+	// DNS servers from settings (wizard / admin UI) drive the proxy dialer.
+	dnsServers := loadDNSServers(dbCtx, st)
+
 	errc := make(chan error, 2)
 	var proxySrv *proxy.Server
 
@@ -164,6 +168,7 @@ func run(ctx context.Context, cfg config.Config) error {
 		casbAdapter := casb.NewProxyAdapter()
 		slog.Info("CASB catalog loaded", "detectors", len(casbAdapter.Inner.Detectors()))
 
+		dialer := proxy.NewDNSDialer(dnsServers)
 		proxySrv = &proxy.Server{
 			Addr:              cfg.ProxyAddr,
 			Engine:            engine,
@@ -176,12 +181,14 @@ func run(ctx context.Context, cfg config.Config) error {
 			Malware:           clam,
 			MalwareFailClosed: cfg.MalwareFailClosed,
 			RBI:               rbiOrch,
+			Dialer:            dialer,
 		}
 		go func() {
 			errc <- proxySrv.Start(ctx)
 		}()
 		slog.Info("gateway ready", "proxy_addr", cfg.ProxyAddr, "mode", cfg.Mode,
-			"rbi_image", cfg.RBIImage, "max_rbi_sessions", cfg.MaxRBISessions)
+			"rbi_image", cfg.RBIImage, "max_rbi_sessions", cfg.MaxRBISessions,
+			"rbi_network", cfg.RBINetwork, "dns_servers", dialer.Servers())
 	}
 
 	if startMgmt {
@@ -203,21 +210,29 @@ func run(ctx context.Context, cfg config.Config) error {
 			},
 		}
 		mgmtSrv := mgmt.New(mgmt.Deps{
-			Store:        st,
-			Sessions:     sessions,
-			Certs:        certProvider,
-			Engine:       engine,
-			Audit:        audit.New(st),
-			Health:       hc,
-			AdminAddr:    cfg.AdminAddr,
-			ProxyAddr:    cfg.ProxyAddr,
-			SecureCookie: false, // lab default; enable when TLS terminates at admin
-			Version:      Version,
+			Store:           st,
+			Sessions:        sessions,
+			Certs:           certProvider,
+			Engine:          engine,
+			Audit:           audit.New(st),
+			Health:          hc,
+			AdminAddr:       cfg.AdminAddr,
+			ProxyAddr:       cfg.ProxyAddr,
+			PublicProxyHost: cfg.PublicProxyHost,
+			PublicProxyPort: cfg.PublicProxyPort,
+			SecureCookie:    cfg.SecureCookie,
+			Version:         Version,
+			OnDNSServersChanged: func(servers []string) {
+				if proxySrv != nil {
+					proxySrv.SetDNSServers(servers)
+				}
+			},
 		})
 		go func() {
 			errc <- mgmtSrv.Start(ctx, cfg.AdminAddr)
 		}()
-		slog.Info("management API ready", "admin_addr", cfg.AdminAddr, "mode", cfg.Mode)
+		slog.Info("management API ready", "admin_addr", cfg.AdminAddr, "mode", cfg.Mode,
+			"secure_cookie", cfg.SecureCookie)
 	}
 
 	if !startProxy && !startMgmt {
@@ -269,7 +284,11 @@ func initRBI(cfg config.Config) *rbi.Orchestrator {
 			Runtime:     nil, // Start → ErrDockerUnavailable
 			Image:       cfg.RBIImage,
 			MaxSessions: cfg.MaxRBISessions,
+			Network:     cfg.RBINetwork,
 		})
+	}
+	if cfg.RBICDPHost != "" {
+		rt.CDPHost = cfg.RBICDPHost
 	}
 	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -277,11 +296,34 @@ func initRBI(cfg config.Config) *rbi.Orchestrator {
 		slog.Warn("RBI docker ping failed; isolation will fail-closed until daemon is available",
 			"err", err, "docker_host", cfg.DockerHost)
 	} else {
-		slog.Info("RBI docker ready", "image", cfg.RBIImage, "max_sessions", cfg.MaxRBISessions)
+		slog.Info("RBI docker ready",
+			"image", cfg.RBIImage,
+			"max_sessions", cfg.MaxRBISessions,
+			"network", cfg.RBINetwork,
+			"cdp_host", cfg.RBICDPHost,
+		)
 	}
 	return rbi.NewOrchestrator(rbi.Config{
 		Runtime:     rt,
 		Image:       cfg.RBIImage,
 		MaxSessions: cfg.MaxRBISessions,
+		Network:     cfg.RBINetwork,
 	})
+}
+
+// loadDNSServers reads dns_servers setting JSON array; empty on error/missing.
+func loadDNSServers(ctx context.Context, st *store.Store) []string {
+	if st == nil {
+		return nil
+	}
+	raw, err := st.GetSetting(ctx, store.SettingDNSServers)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var servers []string
+	if err := json.Unmarshal(raw, &servers); err != nil {
+		slog.Warn("parse dns_servers setting", "err", err)
+		return nil
+	}
+	return servers
 }

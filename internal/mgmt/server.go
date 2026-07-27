@@ -47,10 +47,15 @@ type Deps struct {
 	AdminAddr string
 	// ProxyAddr is shown in client-setup (e.g. ":8080").
 	ProxyAddr string
+	// PublicProxyHost/Port override client-facing PAC/proxy coordinates (host-mapped ports).
+	PublicProxyHost string
+	PublicProxyPort string
 	// SecureCookie sets the Secure flag on session cookies (TLS terminations).
 	SecureCookie bool
 	// Version reported by health/export.
 	Version string
+	// OnDNSServersChanged is invoked when setup/settings update dns_servers (optional).
+	OnDNSServersChanged func(servers []string)
 }
 
 // Server is the management HTTP API.
@@ -63,10 +68,13 @@ type Server struct {
 	audit    *audit.Logger
 	health   *health.Checker
 
-	adminAddr    string
-	proxyAddr    string
-	secureCookie bool
-	version      string
+	adminAddr       string
+	proxyAddr       string
+	publicProxyHost string
+	publicProxyPort string
+	secureCookie    bool
+	version         string
+	onDNSChanged    func(servers []string)
 
 	// setupComplete overrides Store.IsSetupComplete when non-nil (tests).
 	setupComplete func(ctx context.Context) (bool, error)
@@ -81,10 +89,13 @@ func New(d Deps) *Server {
 		engine:       d.Engine,
 		audit:        d.Audit,
 		health:       d.Health,
-		adminAddr:    d.AdminAddr,
-		proxyAddr:    d.ProxyAddr,
-		secureCookie: d.SecureCookie,
-		version:      d.Version,
+		adminAddr:       d.AdminAddr,
+		proxyAddr:       d.ProxyAddr,
+		publicProxyHost: d.PublicProxyHost,
+		publicProxyPort: d.PublicProxyPort,
+		secureCookie:    d.SecureCookie,
+		version:         d.Version,
+		onDNSChanged:    d.OnDNSServersChanged,
 	}
 	if s.version == "" {
 		s.version = "0.1.0"

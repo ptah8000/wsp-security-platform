@@ -364,7 +364,7 @@ func (s *Server) ensureHooks() {
 			s.Sessions = NewSessionTracker(s.Store, DefaultSessionIdle)
 		}
 		if s.Dialer == nil {
-			s.Dialer = &net.Dialer{Timeout: 30 * time.Second}
+			s.Dialer = NewDNSDialer(nil)
 		}
 		if s.Transport == nil {
 			s.Transport = &http.Transport{
@@ -377,8 +377,23 @@ func (s *Server) ensureHooks() {
 				ExpectContinueTimeout: 1 * time.Second,
 				// Origin TLS: system roots (MITM is client-side only).
 			}
+		} else if s.Transport.DialContext == nil {
+			s.Transport.DialContext = s.Dialer.DialContext
 		}
 	})
+}
+
+// SetDNSServers updates the proxy dialer's DNS servers when it is a *DNSDialer.
+// Safe to call after Start (settings / wizard network step).
+func (s *Server) SetDNSServers(servers []string) {
+	if s == nil {
+		return
+	}
+	s.ensureHooks()
+	if d, ok := s.Dialer.(*DNSDialer); ok {
+		d.SetServers(servers)
+		slog.Info("proxy DNS servers updated", "servers", d.Servers())
+	}
 }
 
 // needsIsolation reports whether this request must be handled by RBI (fail-closed).
@@ -422,9 +437,10 @@ type malwareScanOutcome struct {
 // scanHTTPBody buffers up to maxBytes, scans via Malware, and returns a
 // replacement body for forwarding. When Content-Length exceeds the cap the
 // body is not scanned (fail-open on size). Scan transport errors honor
-// MalwareFailClosed.
-func (s *Server) scanHTTPBody(ctx context.Context, body io.ReadCloser, contentLength int64) malwareScanOutcome {
-	maxBytes := s.malwareMaxBytes()
+// decision fail_closed OR process-level MalwareFailClosed.
+func (s *Server) scanHTTPBody(ctx context.Context, body io.ReadCloser, contentLength int64, d policy.Decision) malwareScanOutcome {
+	maxBytes := s.malwareMaxBytes(d)
+	failClosed := s.malwareFailClosed(d)
 	if body == nil {
 		return malwareScanOutcome{Body: http.NoBody}
 	}
@@ -443,7 +459,7 @@ func (s *Server) scanHTTPBody(ctx context.Context, body io.ReadCloser, contentLe
 		_ = body.Close()
 		reason := ""
 		errMsg := "malware_buffer: " + err.Error()
-		if s != nil && s.MalwareFailClosed {
+		if failClosed {
 			reason = "Malware scan failed (unable to read body)"
 		} else {
 			slog.Error("malware body buffer failed (fail-open)", "err", err)
@@ -487,7 +503,7 @@ func (s *Server) scanHTTPBody(ctx context.Context, body io.ReadCloser, contentLe
 
 	if scanErr != nil {
 		out.ErrMsg = "malware_scan: " + scanErr.Error()
-		if s != nil && s.MalwareFailClosed {
+		if failClosed {
 			out.BlockReason = "Malware scan unavailable"
 			slog.Error("malware scan failed (fail-closed)", "err", scanErr)
 		} else {
@@ -507,11 +523,21 @@ func (s *Server) scanHTTPBody(ctx context.Context, body io.ReadCloser, contentLe
 	return out
 }
 
-func (s *Server) malwareMaxBytes() int64 {
+func (s *Server) malwareMaxBytes(d policy.Decision) int64 {
+	if d.MalwareMaxBytes > 0 {
+		return d.MalwareMaxBytes
+	}
 	if s != nil && s.MalwareMaxBytes > 0 {
 		return s.MalwareMaxBytes
 	}
 	return malware.DefaultMaxScanBytes
+}
+
+func (s *Server) malwareFailClosed(d policy.Decision) bool {
+	if d.MalwareFailClosed {
+		return true
+	}
+	return s != nil && s.MalwareFailClosed
 }
 
 // multiReadCloser chains a reader with a closer (original body).

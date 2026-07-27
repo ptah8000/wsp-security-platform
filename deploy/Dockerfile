@@ -13,7 +13,7 @@ RUN npm run build
 # -----------------------------------------------------------------------------
 # Stage 2: build Go binary (CGO disabled, embed UI from web/dist)
 # -----------------------------------------------------------------------------
-FROM golang:1.22-alpine AS build
+FROM golang:1.25-alpine AS build
 WORKDIR /src
 
 RUN apk add --no-cache ca-certificates git
@@ -28,6 +28,7 @@ COPY --from=ui /src/web/dist ./web/dist
 
 ENV CGO_ENABLED=0
 ENV GOOS=linux
+ENV GOTOOLCHAIN=auto
 RUN go build -trimpath -ldflags="-s -w" -o /out/wsp ./cmd/wsp
 
 # -----------------------------------------------------------------------------
