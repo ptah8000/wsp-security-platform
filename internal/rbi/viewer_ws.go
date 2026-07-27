@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +23,7 @@ const (
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  16 << 10,
-	WriteBufferSize: 256 << 10,
+	WriteBufferSize: 512 << 10,
 	// Viewer is served under arbitrary isolated origins (MITM); accept all.
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -74,12 +75,16 @@ func (o *Orchestrator) serveViewerHTML(w http.ResponseWriter, req *http.Request,
 		return
 	}
 	_ = sess
+	flags := o.viewerFlags(id)
+	body := []byte(viewerHTML(id, flags))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	// Content-Security-Policy: no origin scripts; only our inline viewer.
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src blob: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
-	_, _ = w.Write([]byte(viewerHTML(id, o.viewerFlags(id))))
+	// Seamless: full-screen viewer; allow WS + data images only.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 type viewerFlags struct {
@@ -124,7 +129,7 @@ func (o *Orchestrator) serveWS(w http.ResponseWriter, req *http.Request, id stri
 	// Periodic pings to detect dead clients.
 	done := make(chan struct{})
 	go func() {
-		t := time.NewTicker(30 * time.Second)
+		t := time.NewTicker(20 * time.Second)
 		defer t.Stop()
 		for {
 			select {
@@ -153,23 +158,45 @@ func (o *Orchestrator) serveWS(w http.ResponseWriter, req *http.Request, id stri
 	}
 }
 
-// WriteIsolationHTML writes the isolation landing page that boots the viewer for a new session.
-// Used by HandleIsolation — does not re-lookup the session beyond embedding the id.
+// WriteIsolationHTML writes a seamless full-screen isolation viewer (same URL bar / origin).
+// Used by HandleIsolation under MITM so the user is not redirected away from the site host.
 func WriteIsolationHTML(w http.ResponseWriter, sessionID, targetURL string, flags viewerFlags) {
 	if w == nil {
 		return
 	}
+	flags.TargetURL = targetURL
+	body := []byte(viewerHTML(sessionID, flags))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src blob: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
+	// Do not advertise isolation; keep UI chrome minimal.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	// Keep-alive safe: explicit length so the browser runs scripts immediately.
 	w.WriteHeader(http.StatusOK)
-	flags.TargetURL = targetURL
-	_, _ = w.Write([]byte(viewerHTML(sessionID, flags)))
+	_, _ = w.Write(body)
+}
+
+// WriteIsolationRedirect is retained for optional admin-plane handoff (not used by default).
+func WriteIsolationRedirect(w http.ResponseWriter, viewerURL, targetURL string) {
+	if w == nil {
+		return
+	}
+	w.Header().Set("Location", viewerURL)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'")
+	w.WriteHeader(http.StatusFound)
+	body := fmt.Sprintf(
+		`<!DOCTYPE html><html><head><meta charset="utf-8"/><meta http-equiv="refresh" content="0;url=%s"/><title></title></head><body></body></html>`,
+		htmlEscape(viewerURL),
+	)
+	_, _ = w.Write([]byte(body))
 }
 
 func viewerHTML(sessionID string, flags viewerFlags) string {
-	// Relative WS path so MITM / same-origin proxy paths work without knowing the gateway host.
+	// Relative WS path so MITM same-origin works without leaving the site host.
 	wsPath := WSPathPrefix + sessionID
 	blockCopy := "false"
 	blockPaste := "false"
@@ -179,10 +206,7 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
 	if flags.BlockCopyTo {
 		blockPaste = "true"
 	}
-	title := "Isolated browser"
-	if flags.TargetURL != "" {
-		title = "Isolated: " + htmlEscape(flags.TargetURL)
-	}
+	// Seamless: no “RBI” branding, full-viewport canvas, subtle loading status only.
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -190,23 +214,17 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>%s</title>
 <style>
-  html,body{margin:0;height:100%%;background:#0f1419;color:#e7ecf1;font-family:system-ui,sans-serif;overflow:hidden}
-  #bar{display:flex;align-items:center;gap:12px;padding:8px 12px;background:#1a2332;border-bottom:1px solid #2a3544;font-size:13px}
-  #bar .badge{background:#c45c26;color:#fff;padding:2px 8px;border-radius:4px;font-weight:600;letter-spacing:.02em}
-  #bar .url{opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-  #status{opacity:.7}
-  #wrap{position:absolute;inset:40px 0 0 0;display:flex;align-items:center;justify-content:center}
-  canvas{max-width:100%%;max-height:100%%;background:#000;cursor:default;box-shadow:0 0 0 1px #2a3544}
-  #err{color:#ff8a80;padding:24px;display:none}
+  html,body{margin:0;height:100%%;background:#111;overflow:hidden;font-family:system-ui,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#111}
+  canvas{max-width:100%%;max-height:100%%;background:#111;cursor:default;outline:none}
+  #status{position:fixed;left:12px;bottom:10px;color:rgba(255,255,255,.45);font-size:12px;pointer-events:none;z-index:2}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;color:#ff8a80;background:#111;padding:24px;text-align:center;z-index:3}
 </style>
 </head>
 <body>
-<div id="bar">
-  <span class="badge">RBI</span>
-  <span class="url" title="%s">%s</span>
-  <span id="status">connecting…</span>
-</div>
-<div id="wrap"><canvas id="c" width="1280" height="720"></canvas><div id="err"></div></div>
+<div id="wrap"><canvas id="c" width="1280" height="720" tabindex="0"></canvas></div>
+<div id="status">Loading…</div>
+<div id="err"></div>
 <script>
 (function(){
   const sessionId = %q;
@@ -218,44 +236,76 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
   const status = document.getElementById('status');
   const errEl = document.getElementById('err');
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(proto + '//' + location.host + wsPath);
+  let ws;
+  let frames = 0;
+  try {
+    ws = new WebSocket(proto + '//' + location.host + wsPath);
+  } catch (e) {
+    showErr('Unable to open secure display channel');
+    return;
+  }
   ws.binaryType = 'arraybuffer';
 
   function showErr(msg){
-    errEl.style.display = 'block';
+    errEl.style.display = 'flex';
     errEl.textContent = msg;
-    status.textContent = 'error';
+    status.textContent = '';
   }
 
-  ws.onopen = () => { status.textContent = 'isolated session'; };
-  ws.onclose = () => { status.textContent = 'session ended'; };
-  ws.onerror = () => { showErr('WebSocket error — isolation viewer disconnected'); };
+  ws.onopen = () => {
+    status.textContent = '';
+    canvas.focus();
+    // Request first frame
+    try { ws.send(JSON.stringify({type:'ping'})); } catch(e) {}
+  };
+  ws.onclose = () => { if (frames === 0) showErr('Secure session ended before content loaded'); else status.textContent = ''; };
+  ws.onerror = () => { if (frames === 0) showErr('Secure session connection failed'); };
+
+  let drawing = false;
+  let pending = null;
+  function paint(dataUrl){
+    pending = dataUrl;
+    if (drawing) return;
+    drawing = true;
+    const img = new Image();
+    img.onload = () => {
+      if (img.width && img.height && (canvas.width !== img.width || canvas.height !== img.height)) {
+        canvas.width = img.width;
+        canvas.height = img.height;
+      }
+      ctx.drawImage(img, 0, 0);
+      frames++;
+      if (frames === 1) status.textContent = '';
+      drawing = false;
+      if (pending && pending !== dataUrl) {
+        const n = pending; pending = null; paint(n);
+      } else {
+        pending = null;
+      }
+    };
+    img.onerror = () => { drawing = false; };
+    img.src = dataUrl;
+  }
 
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch(e) { return; }
     if (msg.type === 'frame' && msg.data) {
-      const img = new Image();
-      img.onload = () => {
-        if (img.width && img.height && (canvas.width !== img.width || canvas.height !== img.height)) {
-          canvas.width = img.width;
-          canvas.height = img.height;
-        }
-        ctx.drawImage(img, 0, 0);
-      };
-      img.src = 'data:image/jpeg;base64,' + msg.data;
+      paint('data:image/jpeg;base64,' + msg.data);
+    } else if (msg.type === 'error' && msg.message) {
+      showErr(msg.message);
     }
   };
 
   function sendInput(event){
-    if (ws.readyState !== 1) return;
+    if (!ws || ws.readyState !== 1) return;
     ws.send(JSON.stringify({type:'input', event:event}));
   }
 
   function relCoords(e){
     const r = canvas.getBoundingClientRect();
-    const sx = canvas.width / r.width;
-    const sy = canvas.height / r.height;
+    const sx = canvas.width / Math.max(r.width, 1);
+    const sy = canvas.height / Math.max(r.height, 1);
     return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy };
   }
 
@@ -274,15 +324,16 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
   });
   canvas.addEventListener('mousedown', e => {
     e.preventDefault();
+    canvas.focus();
     const p = relCoords(e);
     const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
-    sendInput({kind:'mouse', type:'mousePressed', x:p.x, y:p.y, button:button, modifiers:mods(e)});
+    sendInput({kind:'mouse', type:'mousePressed', x:p.x, y:p.y, button:button, clickCount:1, modifiers:mods(e)});
   });
   canvas.addEventListener('mouseup', e => {
     e.preventDefault();
     const p = relCoords(e);
     const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
-    sendInput({kind:'mouse', type:'mouseReleased', x:p.x, y:p.y, button:button, modifiers:mods(e)});
+    sendInput({kind:'mouse', type:'mouseReleased', x:p.x, y:p.y, button:button, clickCount:1, modifiers:mods(e)});
   });
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
@@ -315,7 +366,15 @@ func viewerHTML(sessionID string, flags viewerFlags) string {
 </script>
 </body>
 </html>
-`, title, htmlEscape(flags.TargetURL), htmlEscape(flags.TargetURL), sessionID, wsPath, blockCopy, blockPaste)
+`, htmlEscape(displayTitle(flags.TargetURL)), sessionID, wsPath, blockCopy, blockPaste)
+}
+
+func displayTitle(target string) string {
+	if target == "" {
+		return "Secure session"
+	}
+	// Keep the browser tab title looking like the real site (path/host only).
+	return htmlEscape(target)
 }
 
 func htmlEscape(s string) string {

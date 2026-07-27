@@ -222,6 +222,7 @@ func run(ctx context.Context, cfg config.Config) error {
 			PublicProxyPort: cfg.PublicProxyPort,
 			SecureCookie:    cfg.SecureCookie,
 			Version:         Version,
+			RBI:             rbiOrch,
 			OnDNSServersChanged: func(servers []string) {
 				if proxySrv != nil {
 					proxySrv.SetDNSServers(servers)
@@ -281,10 +282,11 @@ func initRBI(cfg config.Config) *rbi.Orchestrator {
 		slog.Warn("RBI docker client init failed; isolation will fail-closed until fixed",
 			"err", err, "docker_host", cfg.DockerHost)
 		return rbi.NewOrchestrator(rbi.Config{
-			Runtime:     nil, // Start → ErrDockerUnavailable
-			Image:       cfg.RBIImage,
-			MaxSessions: cfg.MaxRBISessions,
-			Network:     cfg.RBINetwork,
+			Runtime:       nil, // Start → ErrDockerUnavailable
+			Image:         cfg.RBIImage,
+			MaxSessions:   cfg.MaxRBISessions,
+			Network:       cfg.RBINetwork,
+			ViewerBaseURL: cfg.PublicAdminURL,
 		})
 	}
 	if cfg.RBICDPHost != "" {
@@ -303,11 +305,15 @@ func initRBI(cfg config.Config) *rbi.Orchestrator {
 			"cdp_host", cfg.RBICDPHost,
 		)
 	}
+	// Seamless product default: in-place MITM viewer (no URL-bar redirect).
+	// PreferRedirect is left false; ViewerBaseURL unused unless we enable debug handoff later.
 	return rbi.NewOrchestrator(rbi.Config{
-		Runtime:     rt,
-		Image:       cfg.RBIImage,
-		MaxSessions: cfg.MaxRBISessions,
-		Network:     cfg.RBINetwork,
+		Runtime:        rt,
+		Image:          cfg.RBIImage,
+		MaxSessions:    cfg.MaxRBISessions,
+		Network:        cfg.RBINetwork,
+		ViewerBaseURL:  cfg.PublicAdminURL,
+		PreferRedirect: false,
 	})
 }
 

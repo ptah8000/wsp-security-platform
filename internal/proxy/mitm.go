@@ -384,6 +384,19 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, br *bufio.Reader, req
 
 	// RBI fail-closed: never forward origin when isolation is required.
 	if needsIsolation(d, s.RBI) {
+		// Subresources under an isolation policy must not touch origin (no JS/CSS/HTML leak).
+		if !isDocumentNavigationRequest(req) {
+			resp := &http.Response{
+				StatusCode: http.StatusNoContent, ProtoMajor: 1, ProtoMinor: 1,
+				Header: make(http.Header), Body: http.NoBody, ContentLength: 0, Close: false,
+			}
+			resp.Header.Set("Cache-Control", "no-store")
+			resp.Header.Set("X-WSP-RBI", "asset-blocked")
+			_ = resp.Write(clientWriter)
+			s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, 0, "rbi_asset_blocked")
+			_ = req.Body.Close()
+			return false
+		}
 		conn, _ := clientWriter.(net.Conn)
 		rw := &mitmResponseWriter{w: clientWriter, conn: conn, br: br, header: make(http.Header)}
 		if s.RBI.HandleIsolation(rw, req, d) {
@@ -648,10 +661,16 @@ func (m *mitmResponseWriter) WriteHeader(statusCode int) {
 		statusCode = http.StatusOK
 	}
 	// Minimal HTTP/1.1 response line + headers; body follows via Write.
+	// Callers should set Content-Length so keep-alive clients finish the body
+	// and run inline scripts (critical for RBI viewer WebSocket bootstrap).
 	var b strings.Builder
 	fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", statusCode, http.StatusText(statusCode))
 	if m.header.Get("Content-Type") == "" {
 		m.header.Set("Content-Type", "text/html; charset=utf-8")
+	}
+	// Prefer Connection: close for isolation HTML so incomplete CL still finishes.
+	if m.header.Get("Connection") == "" && m.header.Get("Content-Length") == "" {
+		m.header.Set("Connection", "close")
 	}
 	for k, vv := range m.header {
 		for _, v := range vv {

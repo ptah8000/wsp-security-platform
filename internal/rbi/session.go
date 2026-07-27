@@ -74,6 +74,10 @@ func (s *liveSession) connectCDP(ctx context.Context) error {
 		return fmt.Errorf("rod connect: %w", err)
 	}
 
+	// Isolated browser is the disposable sandbox: ignore origin TLS errors so
+	// missing CA bundles inside Chromium images do not fail isolation.
+	_ = proto.SecuritySetIgnoreCertificateErrors{Ignore: true}.Call(browser)
+
 	page, err := browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
 		_ = browser.Close()
@@ -84,7 +88,7 @@ func (s *liveSession) connectCDP(ctx context.Context) error {
 		return fmt.Errorf("navigate %s: %w", s.targetURL, err)
 	}
 	// Best-effort wait; don't fail isolation if the page is slow.
-	_ = page.Context(ctx).Timeout(15 * time.Second).WaitLoad()
+	_ = page.Context(ctx).Timeout(20 * time.Second).WaitLoad()
 
 	s.mu.Lock()
 	s.browser = browser
@@ -283,46 +287,117 @@ func (s *liveSession) startScreencast(ctx context.Context, conn *websocket.Conn)
 	s.cancelCast = cancel
 	s.mu.Unlock()
 
-	quality := 60
-	everyNth := 2
+	// Enable page domain (required for screencast / capture on some Chrome builds).
+	_ = proto.PageEnable{}.Call(page)
+
+	quality := 55
+	everyNth := 1
 	startReq := proto.PageStartScreencast{
 		Format:        proto.PageStartScreencastFormatJpeg,
 		Quality:       &quality,
 		EveryNthFrame: &everyNth,
 	}
-	if err := startReq.Call(page); err != nil {
-		cancel()
-		return fmt.Errorf("start screencast: %w", err)
+	useScreencast := startReq.Call(page) == nil
+	if !useScreencast {
+		slog.Info("rbi screencast unavailable; using screenshot polling", "session", s.id)
 	}
 
-	// Listen for frames on a background goroutine.
 	s.castWG.Add(1)
 	go func() {
 		defer s.castWG.Done()
-		// EachEvent blocks; cancel via page context.
 		pageCtx := page.Context(castCtx)
-		wait := pageCtx.EachEvent(func(e *proto.PageScreencastFrame) {
-			// ACK promptly so Chrome continues producing frames.
-			ack := proto.PageScreencastFrameAck{SessionID: e.SessionID}
-			_ = ack.Call(pageCtx)
 
-			// CDP delivers raw JPEG bytes; protocol uses base64 for the viewer.
-			b64 := base64.StdEncoding.EncodeToString(e.Data)
+		writeFrame := func(jpeg []byte) bool {
+			if len(jpeg) == 0 {
+				return true
+			}
+			b64 := base64.StdEncoding.EncodeToString(jpeg)
 			payload, _ := json.Marshal(map[string]string{
 				"type": "frame",
 				"data": b64,
 			})
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			s.mu.Lock()
 			err := conn.WriteMessage(websocket.TextMessage, payload)
 			s.mu.Unlock()
 			if err != nil {
 				cancel()
+				return false
 			}
-		})
-		wait()
+			return true
+		}
+
+		if useScreencast {
+			wait := pageCtx.EachEvent(func(e *proto.PageScreencastFrame) {
+				ack := proto.PageScreencastFrameAck{SessionID: e.SessionID}
+				_ = ack.Call(pageCtx)
+				// e.Data is already decoded bytes in rod (not base64 string).
+				if !writeFrame(e.Data) {
+					return
+				}
+			})
+			// Also poll screenshots as backup for headless builds that stop screencast.
+			go s.pollScreenshots(castCtx, page, writeFrame)
+			wait()
+			return
+		}
+
+		s.pollScreenshots(castCtx, page, writeFrame)
+	}()
+
+	// Push one immediate screenshot so the canvas is not black while screencast warms up.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		s.mu.Lock()
+		p := s.page
+		s.mu.Unlock()
+		if p == nil {
+			return
+		}
+		bin, err := proto.PageCaptureScreenshot{
+			Format:      proto.PageCaptureScreenshotFormatJpeg,
+			Quality:     &quality,
+			FromSurface: true,
+		}.Call(p)
+		if err != nil || bin == nil || len(bin.Data) == 0 {
+			return
+		}
+		b64 := base64.StdEncoding.EncodeToString(bin.Data)
+		payload, _ := json.Marshal(map[string]string{"type": "frame", "data": b64})
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		s.mu.Lock()
+		_ = conn.WriteMessage(websocket.TextMessage, payload)
+		s.mu.Unlock()
 	}()
 
 	return nil
+}
+
+func (s *liveSession) pollScreenshots(ctx context.Context, page *rod.Page, writeFrame func([]byte) bool) {
+	quality := 55
+	t := time.NewTicker(200 * time.Millisecond) // ~5 fps
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if s.stopped.Load() {
+				return
+			}
+			bin, err := proto.PageCaptureScreenshot{
+				Format:      proto.PageCaptureScreenshotFormatJpeg,
+				Quality:     &quality,
+				FromSurface: true,
+			}.Call(page.Context(ctx))
+			if err != nil || bin == nil {
+				continue
+			}
+			if !writeFrame(bin.Data) {
+				return
+			}
+		}
+	}
 }
 
 func (s *liveSession) stopScreencast() {

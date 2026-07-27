@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # -----------------------------------------------------------------------------
 # Stage 1: build admin UI (Vite React + Tailwind → web/dist)
 # -----------------------------------------------------------------------------
@@ -33,8 +31,11 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/wsp ./cmd/wsp
 
 # -----------------------------------------------------------------------------
 # Stage 3: minimal runtime (RBI uses Docker API; Chromium is not in this image)
+# alpine is widely cached and avoids gcr.io pulls behind MITM lab proxies.
 # -----------------------------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates \
+	&& adduser -D -H -u 65532 nonroot
 COPY --from=build /out/wsp /wsp
 EXPOSE 8080 3000
 USER nonroot:nonroot

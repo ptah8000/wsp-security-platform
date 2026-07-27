@@ -1,0 +1,12 @@
+# Local/dev image using a pre-built Linux binary (avoids registry pulls when MITM breaks TLS).
+# Build binary first:
+#   set GOOS=linux GOARCH=amd64 CGO_ENABLED=0
+#   go build -o bin/wsp-linux ./cmd/wsp
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates \
+	&& adduser -D -H -u 65532 nonroot
+COPY bin/wsp-linux /wsp
+RUN chmod +x /wsp
+EXPOSE 8080 3000
+USER nonroot:nonroot
+ENTRYPOINT ["/wsp"]

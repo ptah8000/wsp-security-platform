@@ -146,6 +146,8 @@ func TestOrchestrator_HandleIsolation_Success(t *testing.T) {
 	o.CDPConnect = func(ctx context.Context, s *liveSession) error { return nil }
 
 	req := httptest.NewRequest(http.MethodGet, "https://isolated.example/app", nil)
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Accept", "text/html")
 	rr := httptest.NewRecorder()
 	d := policy.Decision{
 		RBIIsolated:      true,
@@ -155,18 +157,62 @@ func TestOrchestrator_HandleIsolation_Success(t *testing.T) {
 	if !o.HandleIsolation(rr, req, d) {
 		t.Fatal("HandleIsolation should return true when session starts")
 	}
+	// Without ViewerBaseURL: inline HTML viewer.
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d", rr.Code)
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "RBI") || !strings.Contains(body, "/rbi/ws/") {
-		t.Fatalf("viewer HTML missing markers: %s", body[:min(200, len(body))])
+	// Seamless viewer: no "RBI" branding; must still open same-origin WS stream.
+	if !strings.Contains(body, "/rbi/ws/") || !strings.Contains(body, "WebSocket") {
+		t.Fatalf("viewer HTML missing stream markers: %s", body[:min(200, len(body))])
 	}
 	if o.ActiveCount() != 1 {
 		t.Fatalf("active=%d", o.ActiveCount())
 	}
 	if !strings.Contains(rr.Header().Get("Content-Type"), "text/html") {
 		t.Fatalf("ct=%q", rr.Header().Get("Content-Type"))
+	}
+}
+
+func TestOrchestrator_HandleIsolation_SeamlessInPlace(t *testing.T) {
+	rt := &mockRuntime{}
+	// PreferRedirect false (default): seamless in-place viewer.
+	o := NewOrchestrator(Config{Runtime: rt, MaxSessions: 5, ViewerBaseURL: "http://127.0.0.1:3000", PreferRedirect: false})
+	o.CDPConnect = func(ctx context.Context, s *liveSession) error { return nil }
+
+	req := httptest.NewRequest(http.MethodGet, "https://isolated.example/app", nil)
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	rr := httptest.NewRecorder()
+	if !o.HandleIsolation(rr, req, policy.Decision{RBIIsolated: true}) {
+		t.Fatal("expected isolation viewer")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 in-place", rr.Code)
+	}
+	if rr.Header().Get("Location") != "" {
+		t.Fatalf("seamless mode must not redirect, Location=%q", rr.Header().Get("Location"))
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "/rbi/ws/") {
+		t.Fatal("viewer must include same-origin WS path")
+	}
+	if strings.Contains(strings.ToLower(body), "rbi isolation redirect") {
+		t.Fatal("must not show redirect interstitial")
+	}
+}
+
+func TestOrchestrator_HandleIsolation_SkipsAssets(t *testing.T) {
+	rt := &mockRuntime{}
+	o := NewOrchestrator(Config{Runtime: rt})
+	o.CDPConnect = func(ctx context.Context, s *liveSession) error { return nil }
+	req := httptest.NewRequest(http.MethodGet, "https://isolated.example/app.js", nil)
+	req.Header.Set("Sec-Fetch-Dest", "script")
+	rr := httptest.NewRecorder()
+	if o.HandleIsolation(rr, req, policy.Decision{RBIIsolated: true}) {
+		t.Fatal("assets must not start isolation sessions")
+	}
+	if o.ActiveCount() != 0 {
+		t.Fatal("no sessions for assets")
 	}
 }
 

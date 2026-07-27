@@ -160,13 +160,12 @@ func (d *DockerRuntime) CreateAndStart(ctx context.Context, opts CreateOpts) (Co
 	// Attach to the gateway Compose network when set so CDP is reachable via
 	// container IP (published 127.0.0.1 ports are NOT visible from sibling containers).
 	hc := hostConfigBody{
-		Memory:      mem,
-		NanoCPUs:    1_000_000_000, // 1 CPU
-		PidsLimit:   512,
-		AutoRemove:  false,
-		CapDrop:     []string{"ALL"},
+		Memory:     mem,
+		NanoCPUs:   1_000_000_000, // 1 CPU
+		PidsLimit:  512,
+		AutoRemove: false,
+		// Do not CapDrop ALL — breaks Chromium networking/TLS in many images.
 		SecurityOpt: []string{"no-new-privileges:true"},
-		// Publish a host port as fallback for CDPHost / host.docker.internal.
 		PortBindings: map[string][]portBindingBody{
 			portKey: {{
 				HostIP:   "0.0.0.0",
@@ -179,8 +178,14 @@ func (d *DockerRuntime) CreateAndStart(ctx context.Context, opts CreateOpts) (Co
 	}
 
 	body := createContainerBody{
-		Image:  opts.Image,
-		Env:    []string{"CONNECTION_TIMEOUT=600000", "DEFAULT_BLOCK_ADS=false"},
+		Image: opts.Image,
+		// browserless: keep session alive; disable ad-block surprises.
+		Env: []string{
+			"CONNECTION_TIMEOUT=600000",
+			"DEFAULT_BLOCK_ADS=false",
+			// Help Chromium accept public HTTPS when image CA store is incomplete.
+			`DEFAULT_LAUNCH_ARGS=["--ignore-certificate-errors","--no-sandbox","--disable-dev-shm-usage"]`,
+		},
 		Labels: labels,
 		ExposedPorts: map[string]struct{}{
 			portKey: {},

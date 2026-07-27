@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +27,10 @@ type Orchestrator struct {
 	MaxSessions int
 	// Network optional Docker network for RBI containers.
 	Network string
+	// ViewerBaseURL is only used when preferRedirect is true (debug).
+	ViewerBaseURL string
+	// preferRedirect forces admin-plane redirect (not seamless). Default false.
+	preferRedirect bool
 	// IdleTimeout for viewer inactivity / stop after WS close (default 15m).
 	IdleTimeout time.Duration
 	// SessionStartTimeout bounds container create + CDP connect (default 60s).
@@ -38,11 +44,13 @@ type Orchestrator struct {
 
 // Config for NewOrchestrator.
 type Config struct {
-	Runtime     ContainerRuntime
-	Image       string
-	MaxSessions int
-	Network     string
-	IdleTimeout time.Duration
+	Runtime        ContainerRuntime
+	Image          string
+	MaxSessions    int
+	Network        string
+	ViewerBaseURL  string
+	PreferRedirect bool // debug only; seamless in-place is the product default
+	IdleTimeout    time.Duration
 }
 
 // NewOrchestrator returns an Orchestrator. Runtime may be nil only for tests that inject later.
@@ -64,6 +72,8 @@ func NewOrchestrator(cfg Config) *Orchestrator {
 		Image:               img,
 		MaxSessions:         max,
 		Network:             cfg.Network,
+		ViewerBaseURL:       strings.TrimRight(cfg.ViewerBaseURL, "/"),
+		preferRedirect:      cfg.PreferRedirect,
 		IdleTimeout:         idle,
 		SessionStartTimeout: 60 * time.Second,
 		sessions:            make(map[string]*liveSession),
@@ -148,6 +158,9 @@ func (o *Orchestrator) Start(ctx context.Context, targetURL string, opts Session
 	o.sessions[id] = sess
 	o.mu.Unlock()
 
+	// Auto-stop if no viewer attaches (e.g. user abandons redirect) to free slots.
+	go o.reapIfUnattached(id, 2*time.Minute)
+
 	slog.Info("rbi session started",
 		"session", id,
 		"container_id", shortID(info.ID),
@@ -155,6 +168,25 @@ func (o *Orchestrator) Start(ctx context.Context, targetURL string, opts Session
 		"active", o.ActiveCount(),
 	)
 	return sess, nil
+}
+
+func (o *Orchestrator) reapIfUnattached(id string, wait time.Duration) {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	<-timer.C
+	o.mu.RLock()
+	s, ok := o.sessions[id]
+	o.mu.RUnlock()
+	if !ok || s == nil || s.stopped.Load() {
+		return
+	}
+	if s.attached.Load() {
+		return
+	}
+	slog.Info("rbi reaping unattached session", "session", id)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = o.Stop(ctx, id)
 }
 
 // Get returns a live session by id.
@@ -237,7 +269,10 @@ func (o *Orchestrator) ShouldIsolate(d policy.Decision) bool {
 	return d.RBIIsolated
 }
 
-// HandleIsolation starts an RBI session and serves the viewer HTML.
+// HandleIsolation starts an RBI session and serves a seamless same-origin viewer.
+// The user stays on the requested host/path in the address bar; only a pixel
+// stream is shown (no origin HTML/JS). Optional ViewerBaseURL still supports
+// admin-plane handoff for debugging when WSP_RBI_REDIRECT=1 is used via config.
 // Returns true when the client was given a viewer (session started).
 // Returns false when Docker/session start fails so the proxy can fail-closed.
 func (o *Orchestrator) HandleIsolation(w http.ResponseWriter, req *http.Request, d policy.Decision) bool {
@@ -249,10 +284,14 @@ func (o *Orchestrator) HandleIsolation(w http.ResponseWriter, req *http.Request,
 		return o.ServeRBIPath(w, req)
 	}
 
-	target := ""
-	if req.URL != nil {
-		target = req.URL.String()
+	// Only top-level document navigations start isolation. Subresources must never
+	// receive origin bytes under an isolation policy (handled by the proxy).
+	if !IsDocumentNavigation(req) {
+		slog.Debug("rbi skip non-document under isolation policy", "path", req.URL.Path)
+		return false
 	}
+
+	target := isolationTargetURL(req)
 	if target == "" {
 		slog.Warn("rbi HandleIsolation: empty target URL")
 		return false
@@ -277,10 +316,81 @@ func (o *Orchestrator) HandleIsolation(w http.ResponseWriter, req *http.Request,
 		return false
 	}
 
+	// Seamless default: serve viewer under the MITM site origin (same URL bar).
+	// Redirect only if ViewerBaseURL is explicitly set AND Redirect preferred
+	// (we leave ViewerBaseURL empty in product config for seamless UX).
+	if base := strings.TrimRight(o.ViewerBaseURL, "/"); base != "" && o.preferRedirect {
+		loc := base + SessionPathPrefix + sess.ID()
+		WriteIsolationRedirect(w, loc, target)
+		slog.Info("rbi isolation redirect", "session", sess.ID(), "viewer", loc, "target", target)
+		return true
+	}
+
 	WriteIsolationHTML(w, sess.ID(), target, viewerFlags{
 		BlockCopyFrom: opts.BlockCopyFrom,
 		BlockCopyTo:   opts.BlockCopyTo,
 		TargetURL:     target,
 	})
+	slog.Info("rbi isolation viewer served in-place", "session", sess.ID(), "target", target)
 	return true
+}
+
+// IsDocumentNavigation reports top-level navigations that should start RBI.
+// Accept: */* alone is NOT a document (avoids spawning RBI for XHR/images).
+func IsDocumentNavigation(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return false
+	}
+	dest := strings.ToLower(strings.TrimSpace(req.Header.Get("Sec-Fetch-Dest")))
+	switch dest {
+	case "document", "iframe", "frame":
+		return true
+	case "empty":
+		return acceptPrefersHTML(req.Header.Get("Accept"))
+	case "":
+		accept := req.Header.Get("Accept")
+		if accept == "" {
+			return true // curl lab probes
+		}
+		return acceptPrefersHTML(accept)
+	default:
+		return false
+	}
+}
+
+func acceptPrefersHTML(accept string) bool {
+	accept = strings.ToLower(accept)
+	return strings.Contains(accept, "text/html") || strings.Contains(accept, "application/xhtml")
+}
+
+// isolationTargetURL builds a clean navigation URL (no default :443) for Chromium.
+func isolationTargetURL(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	u := *req.URL
+	if u.Scheme == "" {
+		u.Scheme = "https"
+	}
+	host := u.Hostname()
+	if host == "" {
+		host = req.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+	}
+	if host == "" {
+		return ""
+	}
+	u.Host = host
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	// Drop userinfo / fragment noise.
+	u.User = nil
+	u.Fragment = ""
+	return u.String()
 }
