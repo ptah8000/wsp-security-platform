@@ -178,9 +178,11 @@ DECLARE
     end_ts    TIMESTAMPTZ;
     part_name TEXT;
 BEGIN
-    start_ts := date_trunc('month', target AT TIME ZONE 'UTC');
+    -- date_trunc(... AT TIME ZONE 'UTC') yields timestamp without tz (UTC wall clock);
+    -- re-apply AT TIME ZONE 'UTC' so bounds are true UTC TIMESTAMPTZ, not session-local.
+    start_ts := (date_trunc('month', target AT TIME ZONE 'UTC')) AT TIME ZONE 'UTC';
     end_ts := start_ts + INTERVAL '1 month';
-    part_name := 'request_logs_' || to_char(start_ts, 'YYYY_MM');
+    part_name := 'request_logs_' || to_char(start_ts AT TIME ZONE 'UTC', 'YYYY_MM');
 
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS %I PARTITION OF request_logs FOR VALUES FROM (%L) TO (%L)',
@@ -194,8 +196,9 @@ END;
 $$;
 
 -- Seed partitions for current and next UTC month so inserts work immediately.
-SELECT ensure_request_logs_partition(now() AT TIME ZONE 'UTC');
-SELECT ensure_request_logs_partition((now() AT TIME ZONE 'UTC') + INTERVAL '1 month');
+-- Pass TIMESTAMPTZ (now()); do not use now() AT TIME ZONE 'UTC' (timestamp without time zone).
+SELECT ensure_request_logs_partition(now());
+SELECT ensure_request_logs_partition(now() + INTERVAL '1 month');
 
 CREATE INDEX request_logs_ts_idx ON request_logs (ts DESC);
 CREATE INDEX request_logs_client_ip_ts_idx ON request_logs (client_ip, ts DESC);

@@ -40,7 +40,8 @@ services:
       clamav:
         condition: service_started
     # clamav may take a long time to load signatures — wsp must retry clamd
-    restart: unless-stopped
+    # No restart: unless-stopped on wsp — avoids thrash if clamd is slow to ready
+    restart: "no"
 
 volumes:
   pgdata:
