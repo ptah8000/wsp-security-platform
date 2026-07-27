@@ -377,24 +377,15 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 		return
 	}
 
-	// CASB request-side stub.
+	// CASB request-side enforcement (targeted block page on Hit).
 	if reason, err := s.CASB.InspectRequest(req.Context(), req, d); err != nil {
 		slog.Warn("CASB inspect request error", "err", err)
 	} else if reason != "" {
 		d.FinalAction = policy.ActionBlock
 		d.BlockReason = reason
 		pr.Decision = d
-		body := blockpage.Render(s.loadBlockHTML(req.Context(), nil), blockpage.Context{
-			URL: target.String(), Reason: reason, Username: username, ClientIP: clientIPStr, Timestamp: time.Now().UTC(),
-		})
-		resp := &http.Response{
-			StatusCode: http.StatusForbidden, ProtoMajor: 1, ProtoMinor: 1,
-			Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))),
-			ContentLength: int64(len(body)), Close: true,
-		}
-		resp.Header.Set("Content-Type", "text/html; charset=utf-8")
-		_ = resp.Write(clientWriter)
-		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(len(body)), "")
+		n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), nil), target, reason, username, clientIPStr)
+		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(n), "casb")
 		_ = req.Body.Close()
 		return
 	}
@@ -451,22 +442,16 @@ func (s *Server) handleMITMRequest(clientWriter io.Writer, req *http.Request, co
 	}
 	defer resp.Body.Close()
 
-	// CASB response-side stub.
+	// CASB response-side enforcement (targeted block page on Hit).
 	if reason, err := s.CASB.InspectResponse(req.Context(), req, resp, d); err != nil {
 		slog.Warn("CASB inspect response error", "err", err)
 	} else if reason != "" {
 		_ = resp.Body.Close()
-		body := blockpage.Render(s.loadBlockHTML(req.Context(), nil), blockpage.Context{
-			URL: target.String(), Reason: reason, Username: username, ClientIP: clientIPStr, Timestamp: time.Now().UTC(),
-		})
-		br := &http.Response{
-			StatusCode: http.StatusForbidden, ProtoMajor: 1, ProtoMinor: 1,
-			Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))),
-			ContentLength: int64(len(body)), Close: true,
-		}
-		br.Header.Set("Content-Type", "text/html; charset=utf-8")
-		_ = br.Write(clientWriter)
-		s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(len(body)), "")
+		d.FinalAction = policy.ActionBlock
+		d.BlockReason = reason
+		pr.Decision = d
+		n := writeMITMBlock(clientWriter, s.loadBlockHTML(req.Context(), nil), target, reason, username, clientIPStr)
+		s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), "casb")
 		return
 	}
 

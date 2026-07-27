@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wsp-security/wsp/internal/auth"
+	"github.com/wsp-security/wsp/internal/casb"
 	"github.com/wsp-security/wsp/internal/certs"
 	"github.com/wsp-security/wsp/internal/config"
 	"github.com/wsp-security/wsp/internal/logging"
@@ -147,6 +148,9 @@ func run(ctx context.Context, cfg config.Config) error {
 	}
 	pingCancel()
 
+	casbAdapter := casb.NewProxyAdapter()
+	slog.Info("CASB catalog loaded", "detectors", len(casbAdapter.Inner.Detectors()))
+
 	srv := &proxy.Server{
 		Addr:              cfg.ProxyAddr,
 		Engine:            engine,
@@ -155,6 +159,7 @@ func run(ctx context.Context, cfg config.Config) error {
 		Recorder:          rec,
 		AuthCache:         authCache,
 		Sessions:          proxy.NewSessionTracker(st, proxy.DefaultSessionIdle),
+		CASB:              casbAdapter,
 		Malware:           clam,
 		MalwareFailClosed: cfg.MalwareFailClosed,
 	}

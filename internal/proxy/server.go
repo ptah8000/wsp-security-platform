@@ -231,6 +231,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// CASB request-side: targeted block page when a restriction hits.
 	if reason, err := s.CASB.InspectRequest(req.Context(), req, d); err != nil {
 		slog.Warn("CASB inspect request error", "err", err)
 	} else if reason != "" {
@@ -238,7 +239,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		d.BlockReason = reason
 		pr.Decision = d
 		n := s.writeBlockPage(w, req, d, clientIPStr, username, target)
-		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(n), "")
+		s.recordOutcome(req.Context(), pr, req, target, "block", req.ContentLength, int64(n), "casb")
 		return
 	}
 
@@ -284,6 +285,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// CASB response-side: targeted block page when a restriction hits.
 	if reason, err := s.CASB.InspectResponse(req.Context(), req, resp, d); err != nil {
 		slog.Warn("CASB inspect response error", "err", err)
 	} else if reason != "" {
@@ -291,7 +293,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		d.BlockReason = reason
 		pr.Decision = d
 		n := s.writeBlockPage(w, req, d, clientIPStr, username, target)
-		s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), "")
+		s.recordOutcome(req.Context(), pr, req, target, "block", reqSize, int64(n), "casb")
 		return
 	}
 

@@ -17,14 +17,17 @@ import (
 
 	"github.com/wsp-security/wsp/internal/auth"
 	"github.com/wsp-security/wsp/internal/blockpage"
+	"github.com/wsp-security/wsp/internal/casb"
 	"github.com/wsp-security/wsp/internal/logging"
 	"github.com/wsp-security/wsp/internal/malware"
 	"github.com/wsp-security/wsp/internal/policy"
 )
 
-// Pipeline hook interfaces (stubs until later tasks).
+// Pipeline hook interfaces.
 
 // CASBInspector inspects request/response for cloud app controls.
+// Implementations live in package casb (e.g. casb.ProxyAdapter). Returns a
+// targeted block reason string when a restriction hits; empty means allow.
 type CASBInspector interface {
 	// InspectRequest returns a block reason when the request should be denied.
 	InspectRequest(ctx context.Context, req *http.Request, d policy.Decision) (blockReason string, err error)
@@ -40,7 +43,8 @@ type RBIOrchestrator interface {
 	HandleIsolation(w http.ResponseWriter, req *http.Request, d policy.Decision) bool
 }
 
-// noopCASB is the default CASB stub.
+// noopCASB is a silent no-op used only when explicitly desired in tests.
+// Production defaults to casb.NewProxyAdapter() via ensureHooks / main.
 type noopCASB struct{}
 
 func (noopCASB) InspectRequest(context.Context, *http.Request, policy.Decision) (string, error) {
@@ -336,7 +340,8 @@ func (s *Server) ensureHooks() {
 	}
 	s.hooksOnce.Do(func() {
 		if s.CASB == nil {
-			s.CASB = noopCASB{}
+			// Default: full CASB catalog (no-op only when Decision.CASB is empty).
+			s.CASB = casb.NewProxyAdapter()
 		}
 		if s.Malware == nil {
 			s.Malware = malware.Nop{}
